@@ -9,16 +9,74 @@ Design principles:
       {"error": {"code": "...", "message": "..."}, "request_id": "..."}
   - Unhandled exceptions fall through to a catch-all handler that logs
     the full traceback without leaking internals to the client.
+
+Upstream-service errors (ServiceError):
+  - All errors from external services are normalised to a 4-field dict:
+      {"error_code": "...", "message": "...", "service": "...", "details": {...}}
+  - ErrorCode enum keeps error identifiers free of magic strings.
+  - DeployServiceError maps deploy-service HTTP responses to the schema
+    and inherits from BaseAppException for consistent handling.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ErrorCode Enum  — business-level, NOT coupled to HTTP status codes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ErrorCode(StrEnum):
+    """Machine-readable business error identifiers.
+
+    Kept separate from HTTP status so that a single HTTP status (e.g. 404) can
+    have multiple, semantically distinct error codes (PIPELINE_NOT_FOUND,
+    USER_NOT_FOUND, …).
+    """
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    PIPELINE_NOT_FOUND         = "PIPELINE_NOT_FOUND"
+    PIPELINE_CONFLICT          = "PIPELINE_CONFLICT"
+    PIPELINE_TRIGGER_FAILED    = "PIPELINE_TRIGGER_FAILED"
+    PIPELINE_CANCEL_FAILED     = "PIPELINE_CANCEL_FAILED"
+    PIPELINE_RETRY_FAILED      = "PIPELINE_RETRY_FAILED"
+
+    # ── Deploy-service level ──────────────────────────────────────────────────
+    DEPLOY_SERVICE_UNAVAILABLE = "DEPLOY_SERVICE_UNAVAILABLE"
+    DEPLOY_SERVICE_AUTH_ERROR  = "DEPLOY_SERVICE_AUTH_ERROR"
+    DEPLOY_SERVICE_FORBIDDEN   = "DEPLOY_SERVICE_FORBIDDEN"
+
+    # ── Generic upstream ──────────────────────────────────────────────────────
+    UPSTREAM_ERROR             = "UPSTREAM_ERROR"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ServiceError — abstract interface for upstream service error adapters
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ServiceError(ABC):
+    """Contract that every upstream-service error adapter must implement.
+
+    The unified schema:
+        {
+            "error_code": "<ErrorCode>",
+            "message":    "<human-readable>",
+            "service":    "<service-name>",
+            "details":    {<service-specific data>}
+        }
+    """
+
+    @abstractmethod
+    def to_response(self) -> dict:
+        """Return the 4-field unified error payload."""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -44,8 +102,6 @@ class BaseAppException(Exception):
         self.detail = detail
 
         # Auto-detect caller's qualified name when not provided.
-        # co_qualname (Python 3.11+) returns e.g. "MyClass.my_method"
-        # so renaming the function or class is reflected here automatically.
         if source_function:
             self.source_function = source_function
         else:
@@ -65,6 +121,78 @@ class BaseAppException(Exception):
             self.source_function or "unknown",
             self.detail,
         )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Upstream Service Exceptions
+# ───────────────────────────────────────────────────────────────────────────
+
+class UpstreamServiceException(BaseAppException):
+    """Base class for exceptions originating from upstream services."""
+
+    http_status = 502
+    error_code = "UPSTREAM_ERROR"
+    log_level = logging.ERROR
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DeployServiceError — adapts deploy-service HTTP error → unified schema
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Mapping from deploy-service's error.code strings to our ErrorCode enum.
+_DEPLOY_CODE_MAP: dict[str, ErrorCode] = {
+    "NOT_FOUND":  ErrorCode.PIPELINE_NOT_FOUND,
+    "CONFLICT":   ErrorCode.PIPELINE_CONFLICT,
+    "AUTH_ERROR": ErrorCode.DEPLOY_SERVICE_AUTH_ERROR,
+    "FORBIDDEN":  ErrorCode.DEPLOY_SERVICE_FORBIDDEN,
+}
+
+# Fallback: map HTTP status → ErrorCode when response body is absent or unrecognised.
+_DEPLOY_STATUS_MAP: dict[int, ErrorCode] = {
+    401: ErrorCode.DEPLOY_SERVICE_AUTH_ERROR,
+    403: ErrorCode.DEPLOY_SERVICE_FORBIDDEN,
+    404: ErrorCode.PIPELINE_NOT_FOUND,
+    409: ErrorCode.PIPELINE_CONFLICT,
+    503: ErrorCode.DEPLOY_SERVICE_UNAVAILABLE,
+}
+
+
+class DeployServiceError(UpstreamServiceException, ServiceError):
+    """Exception raised for errors returned by deploy-service.
+
+    Adapts a deploy-service HTTP error response to the unified 4-field schema.
+    deploy-service error body shape:
+        {"error": {"code": "...", "message": "...", "detail": ...}, "request_id": "..."}
+    """
+
+    SERVICE_NAME = "deploy-service"
+
+    def __init__(self, http_status: int, body: dict) -> None:
+        self.upstream_status = http_status
+        error_block: dict = body.get("error", {}) if isinstance(body, dict) else {}
+        raw_code: str = error_block.get("code", "")
+        self._error_code: ErrorCode = (
+            _DEPLOY_CODE_MAP.get(raw_code)
+            or _DEPLOY_STATUS_MAP.get(http_status)
+            or ErrorCode.UPSTREAM_ERROR
+        )
+        self._message: str = error_block.get(
+            "message", f"deploy-service returned HTTP {http_status}."
+        )
+        self._details: Any = error_block.get("detail")
+        
+        # Populate BaseAppException fields
+        super().__init__(message=self._message, detail=self.to_response())
+
+    def to_response(self) -> dict:
+        payload: dict = {
+            "error_code": self._error_code,
+            "message":    self._message,
+            "service":    self.SERVICE_NAME,
+        }
+        if self._details is not None:
+            payload["details"] = self._details
+        return payload
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,11 +247,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _error_body(code: str, message: str, request_id: str, detail: Any = None) -> dict:
-    """Build the standard error response body.
-
-    Shape:
-        {"error": {"code": "...", "message": "...", "detail": ...}, "request_id": "..."}
-    """
+    """Build the standard error response body."""
     error: dict = {"code": code, "message": message}
     if detail is not None:
         error["detail"] = detail
@@ -133,7 +257,11 @@ def _error_body(code: str, message: str, request_id: str, detail: Any = None) ->
 async def app_exception_handler(
     request: Request, exc: BaseAppException
 ) -> JSONResponse:
-    """Handle all BaseAppException subclasses with a unified JSON error response."""
+    """Handle all BaseAppException subclasses with a unified JSON error response.
+    
+    If the exception has a 'detail' field (like DeployServiceError), it is 
+    forwarded verbatim to the caller.
+    """
     request_id: str = getattr(request.state, "request_id", "")
     exc.log(_logger)
 
@@ -151,11 +279,7 @@ async def app_exception_handler(
 async def unhandled_exception_handler(
     request: Request, exc: Exception
 ) -> JSONResponse:
-    """Catch-all handler for unexpected exceptions.
-
-    Logs the full traceback but returns a generic message to the client
-    to avoid leaking internal implementation details.
-    """
+    """Catch-all handler for unexpected exceptions."""
     request_id: str = getattr(request.state, "request_id", "")
     _logger.exception(
         "Unhandled exception | request_id=%s | path=%s",

@@ -4,6 +4,7 @@
         "hashed_password": "$2b$12$c7.QAfMgoAEbN8ChrGKzZuwx66R8Q7I2W3AyECT23MJoaPo3uWM3C",
         "scopes": [
             "cluster_api",
+            "deploy_api",
             "vm_api"
         ]
     },

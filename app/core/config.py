@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     USERS_JSON_PATH: str = "data/users.json"
 
+    # ── Deploy Service ────────────────────────────────────────────────────────
+    DEPLOY_SERVICE_URL: str = "http://localhost:8001"
+    DEPLOY_SERVICE_USERNAME: str = "cluster-service"
+    DEPLOY_SERVICE_PASSWORD: str = ""
+    DEPLOY_SERVICE_TOKEN: str = ""  # Optional initial/cached token
+
     model_config = SettingsConfigDict(
         # Load order: .env (base) → .env.{APP_ENV} (env-specific overrides).
         # Missing files are silently ignored, so a plain .env alone is enough.
