@@ -40,6 +40,14 @@ class TriggerPipelineRequest(BaseModel):
 # Data payloads (returned inside ApiResponse[T])
 # ──────────────────────────────────────────────────────────────────────────────
 
+class JobData(BaseModel):
+    """Job summary returned inside PipelineData."""
+
+    id: int
+    name: str
+    status: str
+
+
 class PipelineData(BaseModel):
     """Pipeline summary returned by all deploy endpoints."""
 
@@ -56,6 +64,10 @@ class PipelineData(BaseModel):
     variables: list[PipelineVariable] = Field(
         default_factory=list,
         description="All variables the pipeline was triggered with.",
+    )
+    jobs: list[JobData] = Field(
+        default_factory=list,
+        description="All jobs associated with this pipeline.",
     )
     ref_name: str = ""
     web_url: str = ""
