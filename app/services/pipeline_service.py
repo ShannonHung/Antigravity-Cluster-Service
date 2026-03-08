@@ -22,6 +22,7 @@ from app.domain.pipeline_models import (
     PipelineData,
     PipelineVariable,
     RunningPipelinesData,
+    FormattedLogResponse,
 )
 
 _logger = logging.getLogger(__name__)
@@ -82,3 +83,11 @@ class PipelineService:
         """Retry a failed or cancelled pipeline."""
         _logger.info("Retrying pipeline | id=%s", pipeline_id)
         return await self._client.retry_pipeline(pipeline_id)
+
+    async def get_job_trace(self, job_id: int) -> str:
+        """Return the raw console output for a job."""
+        return await self._client.get_job_trace(job_id)
+
+    async def get_formatted_job_trace(self, job_id: int, offset: int = 0) -> FormattedLogResponse:
+        """Return processed HTML logs (proxied)."""
+        return await self._client.get_formatted_job_trace(job_id, offset)

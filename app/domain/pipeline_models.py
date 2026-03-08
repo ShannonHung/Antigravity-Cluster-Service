@@ -10,6 +10,7 @@ fully independent — it never imports from deploy-service's source tree.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -92,3 +93,24 @@ class RunningPipelinesData(BaseModel):
     has_running: bool
     count: int
     pipelines: list[PipelineData]
+
+
+class FormattedLogLine(BaseModel):
+    """A single processed log line with metadata."""
+
+    num: int
+    timestamp: str
+    content_html: str
+    is_section_header: bool = False
+    is_section_end: bool = False
+    section_id: Optional[str] = None
+    depth: int = 0
+
+
+class FormattedLogResponse(BaseModel):
+    """The full collection of processed log lines for UI rendering."""
+
+    job_id: int
+    status: str
+    next_offset: int
+    lines: list[FormattedLogLine]

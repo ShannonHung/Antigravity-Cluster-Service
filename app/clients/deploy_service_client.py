@@ -14,10 +14,9 @@ import httpx
 from app.core.exceptions import DeployServiceError, UpstreamServiceException
 from app.core.token_manager import TokenManager
 from app.domain.pipeline_models import (
-    PipelineData,
-    PipelineVariable,
     RunningPipelinesData,
     TriggerPipelineRequest,
+    FormattedLogResponse,
 )
 
 _logger = logging.getLogger(__name__)
@@ -153,3 +152,34 @@ class DeployServiceClient:
             context="retry_pipeline",
         )
         return PipelineData(**raw["data"])
+
+    async def get_job_trace(self, job_id: int) -> str:
+        """Retrieve raw job console output from deploy-service."""
+        # Note: This returns raw text, not JSON with ApiResponse wrapper
+        headers = await self._headers()
+        async with httpx.AsyncClient(
+            base_url=self._base_url, timeout=self._timeout
+        ) as client:
+            response = await client.get(
+                f"/api/v1/deploy/jobs/{job_id}/trace", headers=headers
+            )
+            if response.status_code == 401:
+                await self._token_manager.refresh()
+                headers = await self._headers()
+                response = await client.get(
+                    f"/api/v1/deploy/jobs/{job_id}/trace", headers=headers
+                )
+
+        if response.is_error:
+            self._raise_for_error(response, "get_job_trace")
+
+        return response.text
+
+    async def get_formatted_job_trace(self, job_id: int, offset: int = 0) -> FormattedLogResponse:
+        """Retrieve formatted job logs from deploy-service."""
+        raw = await self._request_with_retry(
+            "GET",
+            f"/api/v1/deploy/jobs/{job_id}/trace/ui?offset={offset}",
+            context="get_formatted_job_trace",
+        )
+        return FormattedLogResponse(**raw["data"])

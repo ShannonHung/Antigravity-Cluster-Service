@@ -11,17 +11,20 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import HTMLResponse
 
 from app.clients.deploy_service_client import DeployServiceClient
 from app.core.config import get_settings
 from app.core.dependencies import get_current_user
 from app.core.token_manager import DeployServiceTokenManager
-from app.domain.models import ApiResponse
+from app.core.log_viewer_template import LOG_VIEWER_HTML
+from app.domain.models import ApiResponse, User
 from app.domain.pipeline_models import (
     PipelineData,
     PipelineVariable,
     RunningPipelinesData,
     TriggerPipelineRequest,
+    FormattedLogResponse,
 )
 from app.services.pipeline_service import PipelineService
 
@@ -30,7 +33,6 @@ _logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/deploy",
     tags=["deploy"],
-    dependencies=[Depends(get_current_user(["deploy_api"]))],
 )
 
 # Shared Token Manager instance (module-level singleton for this service)
@@ -82,6 +84,7 @@ async def trigger_pipeline(
     ref_name: str = Query(default="main", description="Git branch or tag to run pipeline on"),
     body: TriggerPipelineRequest = TriggerPipelineRequest(),
     svc: PipelineService = Depends(_get_pipeline_service),
+    current_user: Annotated[User, Depends(get_current_user(["deploy_api"]))] = None,
 ) -> ApiResponse[PipelineData]:
     data = await svc.trigger_pipeline(
         action=action,
@@ -108,6 +111,7 @@ async def check_running(
     ref_name: str = Query(default="main", description="Branch or tag to filter on"),
     body: TriggerPipelineRequest = TriggerPipelineRequest(),
     svc: PipelineService = Depends(_get_pipeline_service),
+    current_user: Annotated[User, Depends(get_current_user(["deploy_api"]))] = None,
 ) -> ApiResponse[RunningPipelinesData]:
     data = await svc.check_running(
         action=action,
@@ -129,6 +133,7 @@ async def get_pipeline(
     request: Request,
     pipeline_id: int,
     svc: PipelineService = Depends(_get_pipeline_service),
+    current_user: Annotated[User, Depends(get_current_user(["deploy_api"]))] = None,
 ) -> ApiResponse[PipelineData]:
     data = await svc.get_pipeline(pipeline_id)
     return ApiResponse(data=data, request_id=_request_id(request))
@@ -146,6 +151,7 @@ async def cancel_pipeline(
     request: Request,
     pipeline_id: int,
     svc: PipelineService = Depends(_get_pipeline_service),
+    current_user: Annotated[User, Depends(get_current_user(["deploy_api"]))] = None,
 ) -> ApiResponse[PipelineData]:
     data = await svc.cancel_pipeline(pipeline_id)
     return ApiResponse(data=data, request_id=_request_id(request))
@@ -163,6 +169,49 @@ async def retry_pipeline(
     request: Request,
     pipeline_id: int,
     svc: PipelineService = Depends(_get_pipeline_service),
+    current_user: Annotated[User, Depends(get_current_user(["deploy_api"]))] = None,
 ) -> ApiResponse[PipelineData]:
     data = await svc.retry_pipeline(pipeline_id)
     return ApiResponse(data=data, request_id=_request_id(request))
+
+
+# ── GET /api/v1/deploy/jobs/{job_id}/trace ──────────────────────────────
+
+@router.get(
+    "/jobs/{job_id}/trace",
+    summary="Get job console logs",
+    description="Returns the raw console output for a specific job ID (proxied).",
+)
+async def get_job_trace(
+    job_id: int,
+    svc: PipelineService = Depends(_get_pipeline_service),
+) -> str:
+    """Returns raw text trace directly."""
+    return await svc.get_job_trace(job_id)
+
+
+@router.get(
+    "/jobs/{job_id}/trace/ui",
+    response_model=ApiResponse[FormattedLogResponse],
+    summary="Get formatted job logs for UI",
+    description="Returns processed HTML lines (proxied from deploy-service).",
+)
+async def get_formatted_job_trace(
+    request: Request,
+    job_id: int,
+    offset: int = 0,
+    svc: PipelineService = Depends(_get_pipeline_service),
+) -> ApiResponse[FormattedLogResponse]:
+    data = await svc.get_formatted_job_trace(job_id, offset)
+    return ApiResponse(data=data, request_id=_request_id(request))
+
+
+@router.get(
+    "/jobs/{job_id}/view",
+    response_class=HTMLResponse,
+    summary="View job logs in UI",
+    description="Opens a beautiful, auto-refreshing log viewer for the specific job.",
+)
+async def view_job(job_id: int):
+    """Returns a styled HTML log viewer."""
+    return LOG_VIEWER_HTML.format(job_id=job_id)
