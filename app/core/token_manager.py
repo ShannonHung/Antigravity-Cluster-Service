@@ -16,6 +16,8 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from app.core.exceptions import AuthException
+
 _logger = logging.getLogger(__name__)
 
 class TokenManager(ABC):
@@ -81,8 +83,8 @@ class DeployServiceTokenManager(TokenManager):
             
             if response.status_code != 200:
                 _logger.error(f"Failed to fetch token from deploy-service: {response.text}")
-                # We could raise a specific exception here if needed
-                response.raise_for_status()
+                # Properly raise AuthException instead of a raw httpx error that causes a 500
+                raise AuthException("Failed to authenticate with deploy-service.")
                 
             data = response.json()
             # access_token and expires_in (seconds)
