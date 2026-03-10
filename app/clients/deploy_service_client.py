@@ -14,6 +14,7 @@ import httpx
 from app.core.exceptions import DeployServiceError, UpstreamServiceException
 from app.core.token_manager import TokenManager
 from app.domain.pipeline_models import (
+    PipelineData,
     RunningPipelinesData,
     TriggerPipelineRequest,
 )
