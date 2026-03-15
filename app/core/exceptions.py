@@ -57,6 +57,12 @@ class ErrorCode(StrEnum):
     # ── Generic upstream ──────────────────────────────────────────────────────
     UPSTREAM_ERROR             = "UPSTREAM_ERROR"
 
+    # ── Kubernetes cluster ────────────────────────────────────────────────────
+    CLUSTER_NOT_FOUND          = "CLUSTER_NOT_FOUND"
+    NODE_NOT_FOUND             = "NODE_NOT_FOUND"
+    NODE_OPERATION_FAILED      = "NODE_OPERATION_FAILED"
+    KUBE_API_ERROR             = "KUBE_API_ERROR"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ServiceError — abstract interface for upstream service error adapters
@@ -243,6 +249,40 @@ class ConflictException(BaseAppException):
     http_status = 409
     error_code = "CONFLICT"
     log_level = logging.WARNING
+
+
+class ClusterNotFoundException(BaseAppException):
+    """Raised when the requested cluster kubeconfig cannot be found."""
+
+    http_status = 404
+    error_code = ErrorCode.CLUSTER_NOT_FOUND
+    log_level = logging.INFO
+
+
+class NodeNotFoundException(BaseAppException):
+    """Raised when the requested Kubernetes node does not exist."""
+
+    http_status = 404
+    error_code = ErrorCode.NODE_NOT_FOUND
+    log_level = logging.INFO
+
+
+class KubeApiException(BaseAppException):
+    """Raised when the Kubernetes API returns an unexpected error.
+
+    Wraps ``kubernetes.client.ApiException`` and normalises it into
+    the standard error envelope.  HTTP status mirrors the upstream
+    K8s status when available, falling back to 502.
+    """
+
+    error_code = ErrorCode.KUBE_API_ERROR
+    log_level = logging.ERROR
+
+    def __init__(self, message: str, *, kube_status: int = 502, **kwargs) -> None:
+        # Use the Kubernetes API status as our HTTP status when it makes sense;
+        # otherwise default to 502 (bad gateway from the K8s control plane).
+        self.http_status = kube_status if kube_status >= 400 else 502
+        super().__init__(message, **kwargs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

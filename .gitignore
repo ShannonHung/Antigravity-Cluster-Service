@@ -33,3 +33,6 @@ coverage.xml
 
 # uv
 uv.lock
+
+# personal data
+data/kubeconfigs/k3d-mycluster.yaml

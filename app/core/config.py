@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # ── Storage ───────────────────────────────────────────────────────────────
     USERS_JSON_PATH: str = "data/users.json"
 
+    # ── Kubernetes ────────────────────────────────────────────────────────────
+    # Base directory containing one kubeconfig file per cluster.
+    # Override at runtime: KUBECONFIG_BASE_PATH=/etc/kubeconfigs
+    KUBECONFIG_BASE_PATH: str = "data/kubeconfigs"
+
     # ── Deploy Service ────────────────────────────────────────────────────────
     DEPLOY_SERVICE_URL: str = "http://localhost:8001"
     DEPLOY_SERVICE_USERNAME: str = "cluster-service"
