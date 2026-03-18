@@ -4,20 +4,44 @@ app/domain/kubernetes_models.py
 Pydantic models for Kubernetes cluster management operations.
 
 Layers:
-  - Request models  : validated HTTP request bodies (DrainOptions, DrainRequest)
-  - Response models : HTTP response payloads (NodeActionData, NodeListData, …)
+  - Config models   : KubeClientConfig — carries resolved cluster credentials
+  - Request models  : DrainOptions, DrainRequest, NodePatchRequest
+  - Response models : NodeActionData, DrainActionData, NodeInfo, NodeListData, …
 
-Response convention (mirrors the rest of the codebase):
+Response convention:
   Success → ApiResponse[T] → {"data": <T>, "request_id": "..."}
-  Node action success body:
-    {"status": "success", "cluster": "…", "node": "…", "action": "…"}
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cluster config — passed between Repository → Factory
+# ──────────────────────────────────────────────────────────────────────────────
+
+class KubeClientConfig(BaseModel):
+    """Resolved cluster credentials, normalised to a single shape.
+
+    The repository layer produces this object; the KubeClientFactory
+    consumes it to build an ApiClient.  Callers never need to know which
+    backing store was used.
+    """
+
+    cluster_name: str
+    source: Literal["yaml", "json", "api"]
+    # ── YAML path auth ─────────────────────────────────────────────────────────
+    kubeconfig_path: Optional[Path] = None
+    # ── Token auth (JSON / API-sourced) ────────────────────────────────────────
+    server: Optional[str] = None
+    ca_data: Optional[str] = None    # base64-encoded PEM CA certificate
+    token: Optional[str] = None      # bearer token
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -27,14 +51,10 @@ from pydantic import BaseModel, Field
 class DrainOptions(BaseModel):
     """Maps 1-to-1 onto ``kubectl drain`` flags.
 
-    Having a structured model keeps the HTTP body clean and lets the service
-    layer pass options through without unpacking.
+    Note: ``ignore_daemonsets`` is intentionally absent.  DaemonSet pods are
+    **always** skipped — this protection cannot be disabled via the API.
     """
 
-    ignore_daemonsets: bool = Field(
-        default=True,
-        description="Pass --ignore-daemonsets; skip DaemonSet-owned pods.",
-    )
     delete_emptydir_data: bool = Field(
         default=False,
         description="Pass --delete-emptydir-data; remove pods using emptyDir volumes.",
@@ -79,18 +99,65 @@ class DrainRequest(BaseModel):
     )
 
 
+class NodePatchRequest(BaseModel):
+    """HTTP request body for PATCH …/labels and PATCH …/annotations.
+
+    ``set``    — key-value pairs to add or overwrite.
+    ``remove`` — keys whose values will be nulled (Kubernetes deletion pattern).
+    """
+
+    set: dict[str, str] = Field(default_factory=dict, description="Labels/annotations to add or overwrite.")
+    remove: list[str] = Field(default_factory=list, description="Label/annotation keys to delete.")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Response / domain models
 # ──────────────────────────────────────────────────────────────────────────────
 
 class NodeActionData(BaseModel):
-    """Unified response body for cordon / uncordon / drain actions."""
+    """Unified response body for cordon / uncordon actions."""
 
     status: str = "success"
     cluster: str
     node: str
-    action: str  # "cordon" | "uncordon" | "drain"
+    action: str  # "cordon" | "uncordon"
     dry_run: bool = False
+
+
+class DrainedPodInfo(BaseModel):
+    """Identifies a single pod that was evicted/deleted during drain."""
+
+    name: str
+    namespace: str
+
+
+class DrainActionData(BaseModel):
+    """Response body for drain — superset of NodeActionData with pod list."""
+
+    status: str = "success"
+    cluster: str
+    node: str
+    action: str = "drain"
+    dry_run: bool = False
+    drained_pods: list[DrainedPodInfo] = Field(
+        default_factory=list,
+        description="Pods that were evicted or deleted during this drain operation.",
+    )
+
+
+class NodeMetadataData(BaseModel):
+    """Shared response for PATCH /labels and PATCH /annotations.
+
+    Returns the *current* labels and annotations on the node after the
+    patch has been applied, so the caller can confirm the final state.
+    """
+
+    status: str = "success"
+    cluster: str
+    node: str
+    action: str  # "label" | "annotate"
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
 
 
 class NodeCondition(BaseModel):
@@ -101,13 +168,15 @@ class NodeCondition(BaseModel):
 
 
 class NodeInfo(BaseModel):
-    """A single Kubernetes node's key attributes."""
+    """A single Kubernetes node's key attributes (used in list view)."""
 
     name: str
     status: str                          # "Ready" | "NotReady" | "Unknown"
     roles: list[str] = Field(default_factory=list)
     version: str = ""                    # kubelet version
     unschedulable: bool = False          # True when cordoned
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
 
 
 class NodeListData(BaseModel):
@@ -117,11 +186,40 @@ class NodeListData(BaseModel):
     nodes: list[NodeInfo]
 
 
+class PodInfo(BaseModel):
+    """Summary of a pod running on a node."""
+
+    name: str
+    namespace: str
+    phase: str                        # Running | Pending | Succeeded | Failed | Unknown
+    ready: bool = False               # True when all containers are Ready
+    owner_kind: Optional[str] = None  # ReplicaSet | DaemonSet | StatefulSet | Job | None
+    restart_count: int = 0            # sum of restarts across all containers
+
+
+class NodeDetailData(BaseModel):
+    """Full node detail including all node attributes and its running pods.
+
+    Used by GET …/{cluster}/nodes/{node}.
+    Shares the same leaf fields as NodeInfo, adding annotations and pods.
+    """
+
+    cluster: str
+    name: str
+    status: str
+    roles: list[str] = Field(default_factory=list)
+    version: str = ""
+    unschedulable: bool = False
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    pods: list[PodInfo] = Field(default_factory=list)
+
+
 class ClusterInfo(BaseModel):
     """Metadata about a registered cluster."""
 
     name: str
-    kubeconfig_path: str
+    source: str = ""  # "yaml" | "json"
 
 
 class ClusterListData(BaseModel):

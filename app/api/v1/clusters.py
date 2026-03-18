@@ -5,7 +5,7 @@ Cluster-level endpoints (v1).
 
 Routes:
   GET /api/v1/clusters                      → list all registered clusters
-  GET /api/v1/clusters/{cluster}/nodes      → list nodes in a cluster
+  GET /api/v1/clusters/{cluster}/nodes      → list nodes in a cluster (with labels)
 
 All endpoints require the ``cluster_api`` scope.
 """
@@ -22,6 +22,7 @@ from app.core.dependencies import get_current_user
 from app.domain.kubernetes_models import ClusterListData, NodeListData
 from app.domain.models import ApiResponse, User
 from app.repositories.cluster_repository import ClusterRepository
+from app.repositories.yaml_cluster_repository import YamlClusterRepository
 from app.services.cluster_manager import ClusterManager
 from app.services.kube_client import KubeClientFactory
 from app.services.node_service import NodeService
@@ -35,7 +36,7 @@ router = APIRouter(prefix="/clusters", tags=["clusters"])
 
 def _get_cluster_repo() -> ClusterRepository:
     settings = get_settings()
-    return ClusterRepository(settings.KUBECONFIG_BASE_PATH)
+    return YamlClusterRepository(settings.KUBECONFIG_BASE_PATH)
 
 
 def _get_cluster_manager(
@@ -54,10 +55,7 @@ def _request_id(request: Request) -> str:
     "",
     response_model=ApiResponse[ClusterListData],
     summary="List all registered clusters",
-    description=(
-        "Returns the names and kubeconfig paths of every cluster "
-        "registered under the configured kubeconfig directory."
-    ),
+    description="Returns metadata for every cluster found in the configured directory.",
 )
 async def list_clusters(
     request: Request,
@@ -75,8 +73,7 @@ async def list_clusters(
     response_model=ApiResponse[NodeListData],
     summary="List nodes in a cluster",
     description=(
-        "Returns all nodes in the given cluster with their status, "
-        "roles, version, and schedulability."
+        "Returns all nodes with status, roles, version, schedulability, and labels."
     ),
 )
 async def list_nodes(
@@ -85,7 +82,7 @@ async def list_nodes(
     current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))],
     repo: ClusterRepository = Depends(_get_cluster_repo),
 ) -> ApiResponse[NodeListData]:
-    kubeconfig_path = repo.get_kubeconfig(cluster)
-    kube = KubeClientFactory().get_core_v1(kubeconfig_path)
+    cfg = repo.get_kube_client_config(cluster)
+    kube = KubeClientFactory().get_core_v1(cfg)
     data = NodeService().list_nodes(cluster=cluster, kube=kube)
     return ApiResponse(data=data, request_id=_request_id(request))

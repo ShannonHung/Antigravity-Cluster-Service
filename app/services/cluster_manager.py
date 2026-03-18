@@ -1,11 +1,10 @@
 """
 app/services/cluster_manager.py
 
-ClusterManager — high-level Kubernetes cluster orchestration.
+ClusterManager — high-level cluster operations (listing, metadata).
 
-Thin service that brokers between the API layer and ClusterRepository.
-Keeping business logic here (not in routes) makes it easily testable
-and replaceable without touching the HTTP interface.
+Delegates to the injected ClusterRepository, which determines
+the backing store (filesystem YAML, JSON credentials, remote API, …).
 """
 
 from __future__ import annotations
@@ -19,19 +18,17 @@ _logger = logging.getLogger(__name__)
 
 
 class ClusterManager:
-    """Orchestrates cluster-level operations."""
+    """Orchestrates cluster-level operations.
+
+    Args:
+        cluster_repo: Any concrete ClusterRepository implementation.
+    """
 
     def __init__(self, cluster_repo: ClusterRepository) -> None:
         self._repo = cluster_repo
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def list_clusters(self) -> ClusterListData:
-        """Return metadata for every registered cluster.
-
-        Delegates to the repository so the API route never needs to know
-        where configs are stored.
-        """
+        """Return metadata for all registered clusters."""
         clusters = self._repo.list_clusters()
         _logger.info("Listed %d cluster(s)", len(clusters))
         return ClusterListData(clusters=clusters)

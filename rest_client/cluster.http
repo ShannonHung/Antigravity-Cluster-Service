@@ -1,0 +1,201 @@
+@baseUrl = http://localhost:8000
+@cluster = k3d-mycluster
+@agent1  = k3d-mycluster-agent-1-0
+@agent2  = k3d-mycluster-agent-2-0
+
+### Login
+# @name login
+POST {{baseUrl}}/token
+Content-Type: application/x-www-form-urlencoded
+
+username=admin&password=password
+
+### Store token
+@token = {{login.response.body.access_token}}
+
+
+# ══════════════════════════════════════════════════════
+# Clusters
+# ══════════════════════════════════════════════════════
+
+### List all registered clusters
+GET {{baseUrl}}/api/v1/clusters
+Authorization: Bearer {{token}}
+
+
+# ══════════════════════════════════════════════════════
+# Nodes
+# ══════════════════════════════════════════════════════
+
+### List nodes in a cluster (includes labels + annotations)
+GET {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes
+Authorization: Bearer {{token}}
+
+### Get single node detail (full info + pods)
+# Returns: status, roles, version, labels, annotations, unschedulable, pods[]
+GET {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}
+Authorization: Bearer {{token}}
+
+
+# ══════════════════════════════════════════════════════
+# Cordon / Uncordon
+# ══════════════════════════════════════════════════════
+
+### Cordon a node
+# Marks the node as unschedulable.
+# Stamps labels: cordon_reason=PM, cordon_by=infra (configurable via .env)
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/cordon
+Authorization: Bearer {{token}}
+
+### Uncordon a node
+# Re-enables scheduling and removes the cordon labels.
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/uncordon
+Authorization: Bearer {{token}}
+
+
+# ══════════════════════════════════════════════════════
+# Drain
+# ══════════════════════════════════════════════════════
+
+### Drain — dry run (no changes made, returns what would happen)
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/drain
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "dry_run": true,
+    "reason": "scheduled maintenance",
+    "options": {
+        "delete_emptydir_data": false,
+        "force": false,
+        "disable_eviction": false,
+        "timeout_seconds": 300
+    }
+}
+
+### Drain — real drain (evicts using Eviction API, honours PDB)
+# DaemonSet, mirror, and completed pods are always skipped.
+# Response includes drained_pods list.
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/drain
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "dry_run": false,
+    "reason": "scheduled maintenance",
+    "options": {
+        "delete_emptydir_data": false,
+        "force": false,
+        "disable_eviction": false,
+        "timeout_seconds": 300
+    }
+}
+
+### Drain — force delete (bypasses PDB, uses Delete API instead of Eviction)
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/drain
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "dry_run": false,
+    "reason": "emergency maintenance",
+    "options": {
+        "delete_emptydir_data": true,
+        "force": true,
+        "disable_eviction": true,
+        "grace_period_seconds": 5,
+        "timeout_seconds": 120
+    }
+}
+
+
+# ══════════════════════════════════════════════════════
+# Labels
+# ══════════════════════════════════════════════════════
+
+### Add / update labels on a node
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/labels
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": {
+        "env": "prod",
+        "team": "infra"
+    },
+    "remove": []
+}
+
+### Remove labels from a node
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/labels
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": {},
+    "remove": ["env", "team"]
+}
+
+### Set and remove labels in one request
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/labels
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": { "new-label": "new-value" },
+    "remove": ["old-label"]
+}
+
+
+# ══════════════════════════════════════════════════════
+# Annotations
+# ══════════════════════════════════════════════════════
+
+### Add / update annotations on a node
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/annotations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": {
+        "infra/note": "cordoned for maintenance on 2026-03-18",
+        "infra/ticket": "OPS-1234"
+    },
+    "remove": []
+}
+
+### Remove annotations from a node
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/annotations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": {},
+    "remove": ["infra/note", "infra/ticket"]
+}
+
+### Set and remove annotations in one request
+PATCH {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/{{agent1}}/annotations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+    "set": { "infra/updated-at": "2026-03-18T23:00:00+08:00" },
+    "remove": ["infra/old-note"]
+}
+
+
+# ══════════════════════════════════════════════════════
+# Error cases (for testing)
+# ══════════════════════════════════════════════════════
+
+### 404 — cluster does not exist
+GET {{baseUrl}}/api/v1/clusters/nonexistent-cluster/nodes
+Authorization: Bearer {{token}}
+
+### 404 — node does not exist
+POST {{baseUrl}}/api/v1/clusters/{{cluster}}/nodes/ghost-node/cordon
+Authorization: Bearer {{token}}
+
+### 401 — no token
+GET {{baseUrl}}/api/v1/clusters

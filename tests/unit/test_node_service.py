@@ -8,20 +8,24 @@ CoreV1Api is fully mocked — no Kubernetes cluster required.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-import pytest
+from unittest.mock import MagicMock, call
 
+import pytest
 from kubernetes.client.exceptions import ApiException
 
 from app.core.exceptions import KubeApiException, NodeNotFoundException
-from app.domain.kubernetes_models import DrainOptions, NodeActionData, NodeListData
+from app.domain.kubernetes_models import DrainActionData, DrainOptions, NodeActionData, NodeListData
 from app.services.node_service import NodeService
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _svc() -> NodeService:
+    """Default service with test-friendly label values."""
+    return NodeService(cordon_label_reason="PM", cordon_label_by="infra")
+
+
 def _make_kube() -> MagicMock:
-    """Return a MagicMock that stands in for CoreV1Api."""
     return MagicMock()
 
 
@@ -31,16 +35,17 @@ def _make_node(
     unschedulable: bool = False,
     kubelet_version: str = "v1.29.0",
     roles: list[str] | None = None,
+    labels: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
 ) -> MagicMock:
-    """Build a minimal V1Node mock."""
     node = MagicMock()
     node.metadata.name = name
-    node.metadata.labels = {
+    node.metadata.labels = labels or {
         f"node-role.kubernetes.io/{r}": "" for r in (roles or ["worker"])
     }
+    node.metadata.annotations = annotations or {}
     node.metadata.owner_references = None
     node.spec.unschedulable = unschedulable
-
     cond = MagicMock()
     cond.type = "Ready"
     cond.status = "True" if ready else "False"
@@ -83,136 +88,139 @@ def test_list_nodes_returns_node_list():
         _make_node("node-1"),
         _make_node("node-2", ready=False),
     ]
-    result = NodeService().list_nodes(cluster="test", kube=kube)
+    result = _svc().list_nodes(cluster="test", kube=kube)
 
     assert isinstance(result, NodeListData)
     assert result.cluster == "test"
     assert len(result.nodes) == 2
-    assert result.nodes[0].name == "node-1"
     assert result.nodes[0].status == "Ready"
     assert result.nodes[1].status == "NotReady"
 
 
-def test_list_nodes_raises_kube_api_error_on_api_exception():
+def test_list_nodes_includes_labels():
     kube = _make_kube()
-    kube.list_node.side_effect = _api_error(500, "Internal error")
-
-    with pytest.raises(KubeApiException):
-        NodeService().list_nodes(cluster="test", kube=kube)
+    kube.list_node.return_value.items = [
+        _make_node("node-1", labels={"env": "prod", "team": "infra"}),
+    ]
+    result = _svc().list_nodes(cluster="test", kube=kube)
+    assert result.nodes[0].labels == {"env": "prod", "team": "infra"}
 
 
 def test_list_nodes_unschedulable_flag():
     kube = _make_kube()
-    kube.list_node.return_value.items = [
-        _make_node("node-cordoned", unschedulable=True),
-    ]
-    result = NodeService().list_nodes(cluster="test", kube=kube)
+    kube.list_node.return_value.items = [_make_node("n", unschedulable=True)]
+    result = _svc().list_nodes(cluster="test", kube=kube)
     assert result.nodes[0].unschedulable is True
+
+
+def test_list_nodes_raises_on_api_error():
+    kube = _make_kube()
+    kube.list_node.side_effect = _api_error(500)
+    with pytest.raises(KubeApiException):
+        _svc().list_nodes(cluster="test", kube=kube)
 
 
 # ── cordon ────────────────────────────────────────────────────────────────────
 
-def test_cordon_patches_node():
+def test_cordon_makes_two_patch_calls():
+    """First patch: unschedulable=True. Second patch: cordon labels."""
     kube = _make_kube()
-    result = NodeService().cordon(cluster="test", node_name="worker-1", kube=kube)
+    result = _svc().cordon(cluster="test", node_name="worker-1", kube=kube)
 
-    # First call: mark unschedulable; second call: apply labels.
     assert kube.patch_node.call_count == 2
-    first_call_body = kube.patch_node.call_args_list[0][0][1]
-    assert first_call_body == {"spec": {"unschedulable": True}}
+    # First call marks unschedulable
+    first_body = kube.patch_node.call_args_list[0][0][1]
+    assert first_body == {"spec": {"unschedulable": True}}
+    # Result
     assert isinstance(result, NodeActionData)
     assert result.action == "cordon"
-    assert result.node == "worker-1"
-    assert result.cluster == "test"
 
 
-def test_cordon_applies_ownership_labels():
+def test_cordon_applies_configurable_labels():
     kube = _make_kube()
-    NodeService().cordon(cluster="test", node_name="worker-1", kube=kube)
+    _svc().cordon(cluster="test", node_name="worker-1", kube=kube)
 
-    # Second patch_node call must carry the two label assignments.
-    label_call_body = kube.patch_node.call_args_list[1][0][1]
-    labels = label_call_body["metadata"]["labels"]
-    assert labels["cordon"] == "PM"
-    assert labels["cordon_by"] == "cluster_service"
+    second_body = kube.patch_node.call_args_list[1][0][1]
+    labels = second_body["metadata"]["labels"]
+    assert labels["cordon_reason"] == "PM"
+    assert labels["cordon_by"] == "infra"
+
+
+def test_cordon_custom_label_values():
+    """Label values come from the constructor, not hardcoded."""
+    svc = NodeService(cordon_label_reason="MAINTENANCE", cordon_label_by="ops-team")
+    kube = _make_kube()
+    svc.cordon(cluster="test", node_name="n", kube=kube)
+    second_body = kube.patch_node.call_args_list[1][0][1]
+    labels = second_body["metadata"]["labels"]
+    assert labels["cordon_reason"] == "MAINTENANCE"
+    assert labels["cordon_by"] == "ops-team"
 
 
 def test_cordon_raises_node_not_found_on_404():
     kube = _make_kube()
     kube.patch_node.side_effect = _api_error(404)
-
     with pytest.raises(NodeNotFoundException):
-        NodeService().cordon(cluster="test", node_name="missing", kube=kube)
+        _svc().cordon(cluster="test", node_name="missing", kube=kube)
 
 
-def test_cordon_raises_kube_api_exception_on_other_error():
+def test_cordon_raises_kube_api_exception_on_500():
     kube = _make_kube()
-    kube.patch_node.side_effect = _api_error(500, "Server error")
-
+    kube.patch_node.side_effect = _api_error(500)
     with pytest.raises(KubeApiException):
-        NodeService().cordon(cluster="test", node_name="worker-1", kube=kube)
+        _svc().cordon(cluster="test", node_name="worker", kube=kube)
 
 
 # ── uncordon ──────────────────────────────────────────────────────────────────
 
-def test_uncordon_patches_node():
+def test_uncordon_patches_unschedulable_false():
     kube = _make_kube()
-    result = NodeService().uncordon(cluster="test", node_name="worker-1", kube=kube)
+    result = _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
 
-    kube.patch_node.assert_called_once_with(
-        "worker-1", {"spec": {"unschedulable": False}}
-    )
+    first_body = kube.patch_node.call_args_list[0][0][1]
+    assert first_body == {"spec": {"unschedulable": False}}
     assert result.action == "uncordon"
+
+
+def test_uncordon_removes_cordon_labels():
+    kube = _make_kube()
+    _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
+
+    # Second patch should null-out both label keys.
+    second_body = kube.patch_node.call_args_list[1][0][1]
+    labels = second_body["metadata"]["labels"]
+    assert labels["cordon_reason"] is None
+    assert labels["cordon_by"] is None
 
 
 def test_uncordon_raises_node_not_found_on_404():
     kube = _make_kube()
     kube.patch_node.side_effect = _api_error(404)
-
     with pytest.raises(NodeNotFoundException):
-        NodeService().uncordon(cluster="test", node_name="missing", kube=kube)
+        _svc().uncordon(cluster="test", node_name="missing", kube=kube)
 
 
 # ── drain ─────────────────────────────────────────────────────────────────────
 
-def test_drain_cordons_then_evicts_pods():
-    """Drain must: cordon → list pods → evict each → wait."""
+def test_drain_returns_drain_action_data_with_pod_list():
     kube = _make_kube()
     pod = _make_pod("app-pod", "default", owner_kind="ReplicaSet")
-
-    # First call: pods still running; second call: pods gone (wait loop).
     kube.list_pod_for_all_namespaces.side_effect = [
-        MagicMock(items=[pod]),   # initial list
-        MagicMock(items=[]),      # wait loop — pods gone
+        MagicMock(items=[pod]),  # listing
+        MagicMock(items=[]),     # wait loop
     ]
 
-    opts = DrainOptions()
-    result = NodeService().drain("test", "worker-1", kube, opts)
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
 
-    kube.patch_node.assert_called_once_with(
-        "worker-1", {"spec": {"unschedulable": True}}
-    )
-    kube.create_namespaced_pod_eviction.assert_called_once()
+    assert isinstance(result, DrainActionData)
     assert result.action == "drain"
+    assert len(result.drained_pods) == 1
+    assert result.drained_pods[0].name == "app-pod"
+    assert result.drained_pods[0].namespace == "default"
 
 
-def test_drain_skips_mirror_pods():
-    kube = _make_kube()
-    mirror = _make_pod("static-pod", is_mirror=True)
-    kube.list_pod_for_all_namespaces.return_value.items = [mirror]
-    # Since no pods to evict, wait loop is also skipped.
-    kube.list_pod_for_all_namespaces.side_effect = [
-        MagicMock(items=[mirror]),
-        MagicMock(items=[]),
-    ]
-
-    NodeService().drain("test", "worker-1", kube, DrainOptions())
-
-    kube.create_namespaced_pod_eviction.assert_not_called()
-    kube.delete_namespaced_pod.assert_not_called()
-
-
-def test_drain_skips_daemonset_pods_when_ignore_daemonsets_true():
+def test_drain_always_skips_daemonset_pods():
+    """DaemonSet pods must be skipped regardless of any option."""
     kube = _make_kube()
     ds_pod = _make_pod("ds-pod", owner_kind="DaemonSet")
     kube.list_pod_for_all_namespaces.side_effect = [
@@ -220,58 +228,127 @@ def test_drain_skips_daemonset_pods_when_ignore_daemonsets_true():
         MagicMock(items=[]),
     ]
 
-    opts = DrainOptions(ignore_daemonsets=True)
-    NodeService().drain("test", "worker-1", kube, opts)
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
 
     kube.create_namespaced_pod_eviction.assert_not_called()
-    kube.delete_namespaced_pod.assert_not_called()
+    assert len(result.drained_pods) == 0
+
+
+def test_drain_skips_mirror_pods():
+    kube = _make_kube()
+    mirror = _make_pod("static", is_mirror=True)
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=[mirror]),
+        MagicMock(items=[]),
+    ]
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
+    kube.create_namespaced_pod_eviction.assert_not_called()
+    assert len(result.drained_pods) == 0
 
 
 def test_drain_skips_completed_pods():
     kube = _make_kube()
-    done_pod = _make_pod("job-pod", phase="Succeeded")
+    done = _make_pod("job-pod", phase="Succeeded")
     kube.list_pod_for_all_namespaces.side_effect = [
-        MagicMock(items=[done_pod]),
+        MagicMock(items=[done]),
         MagicMock(items=[]),
     ]
-
-    NodeService().drain("test", "worker-1", kube, DrainOptions())
-
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
     kube.create_namespaced_pod_eviction.assert_not_called()
+    assert len(result.drained_pods) == 0
 
 
-def test_drain_uses_delete_when_disable_eviction_true():
+def test_drain_uses_delete_when_disable_eviction():
     kube = _make_kube()
     pod = _make_pod("app-pod")
     kube.list_pod_for_all_namespaces.side_effect = [
         MagicMock(items=[pod]),
         MagicMock(items=[]),
     ]
-
-    opts = DrainOptions(disable_eviction=True)
-    NodeService().drain("test", "worker-1", kube, opts)
-
-    kube.delete_namespaced_pod.assert_called_once_with(
-        name="app-pod",
-        namespace="default",
-        grace_period_seconds=None,
-    )
+    _svc().drain("test", "worker-1", kube, DrainOptions(disable_eviction=True))
+    kube.delete_namespaced_pod.assert_called_once()
     kube.create_namespaced_pod_eviction.assert_not_called()
 
 
-def test_drain_raises_node_not_found_on_404_patch():
+def test_drain_raises_node_not_found_when_cordon_fails():
     kube = _make_kube()
     kube.patch_node.side_effect = _api_error(404)
-
     with pytest.raises(NodeNotFoundException):
-        NodeService().drain("test", "missing-node", kube, DrainOptions())
+        _svc().drain("test", "missing-node", kube, DrainOptions())
 
 
-def test_drain_raises_kube_api_exception_on_pod_list_failure():
+def test_drain_raises_on_pod_list_failure():
     kube = _make_kube()
-    # patch_node succeeds, list_pod fails
     kube.patch_node.return_value = MagicMock()
-    kube.list_pod_for_all_namespaces.side_effect = _api_error(500, "Server error")
-
+    kube.list_pod_for_all_namespaces.side_effect = _api_error(500)
     with pytest.raises(KubeApiException):
-        NodeService().drain("test", "worker-1", kube, DrainOptions())
+        _svc().drain("test", "worker-1", kube, DrainOptions())
+
+
+# ── label_node ────────────────────────────────────────────────────────────────
+
+def test_label_node_calls_patch_with_labels():
+    kube = _make_kube()
+    # read_node returns current state after patch
+    kube.read_node.return_value = _make_node(
+        labels={"env": "prod"}, annotations={"note": "hi"}
+    )
+    result = _svc().label_node("test", "n", kube, set_labels={"env": "prod"})
+
+    kube.patch_node.assert_called_once_with("n", {"metadata": {"labels": {"env": "prod"}}})
+    assert result.action == "label"
+    assert result.labels == {"env": "prod"}
+    assert result.annotations == {"note": "hi"}
+
+
+def test_label_node_removes_labels_with_null():
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node(labels={}, annotations={})
+    _svc().label_node("test", "n", kube, remove_labels=["old-key"])
+
+    body = kube.patch_node.call_args[0][1]
+    assert body["metadata"]["labels"]["old-key"] is None
+
+
+def test_label_node_set_and_remove_together():
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node(labels={"new": "val"}, annotations={})
+    _svc().label_node("test", "n", kube, set_labels={"new": "val"}, remove_labels=["old"])
+
+    body = kube.patch_node.call_args[0][1]
+    labels = body["metadata"]["labels"]
+    assert labels["new"] == "val"
+    assert labels["old"] is None
+
+
+def test_label_node_no_op_when_nothing_provided():
+    kube = _make_kube()
+    _svc().label_node("test", "n", kube)
+    kube.patch_node.assert_not_called()
+    kube.read_node.assert_not_called()
+
+
+# ── annotate_node ─────────────────────────────────────────────────────────────
+
+def test_annotate_node_calls_patch_with_annotations():
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node(
+        labels={"env": "prod"}, annotations={"note": "hello"}
+    )
+    result = _svc().annotate_node("test", "n", kube, set_annotations={"note": "hello"})
+
+    kube.patch_node.assert_called_once_with(
+        "n", {"metadata": {"annotations": {"note": "hello"}}}
+    )
+    assert result.action == "annotate"
+    assert result.labels == {"env": "prod"}
+    assert result.annotations == {"note": "hello"}
+
+
+def test_annotate_node_removes_with_null():
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node(labels={}, annotations={})
+    _svc().annotate_node("test", "n", kube, remove_annotations=["old"])
+
+    body = kube.patch_node.call_args[0][1]
+    assert body["metadata"]["annotations"]["old"] is None

@@ -4,66 +4,70 @@ app/services/node_service.py
 NodeService — implements Kubernetes node operations.
 
 Operations:
-  - list_nodes  : list all nodes and their status
-  - cordon      : mark a node as unschedulable
-  - uncordon    : re-enable scheduling on a node
-  - drain       : cordon + evict/delete all eligible pods
+  - list_nodes  : list all nodes with labels included in response
+  - cordon      : mark node unschedulable + stamp configurable labels
+  - uncordon    : re-enable scheduling + remove cordon labels
+  - drain       : cordon + evict/delete eligible pods → return pod list
+  - label_node  : arbitrary set / remove of node labels
+  - annotate_node: arbitrary set / remove of node annotations
 
-Drain design notes
+Design decisions
 ──────────────────
-The Python kubernetes client has no single ``drain()`` helper equivalent to
-``kubectl drain``.  We implement it by hand:
-
-  1. Cordon the node (patch spec.unschedulable = True).
-  2. List all pods on the node.
-  3. Filter out:
-       - DaemonSet pods (unless ignore_daemonsets=False — rare)
-       - Mirror / static pods (annotation: mirror.k8s.io/pod)
-       - Completed / failed pods (phase in {Succeeded, Failed})
-  4. For each remaining pod:
-       - if disable_eviction=True  → DELETE the pod (bypasses PDB)
-       - else                       → create an Eviction object (honours PDB)
-  5. Wait until all targeted pods are gone (poll until timeout).
-
-``dry_run`` is handled at the API layer: when dry_run=True the service
-is never called; the route short-circuits and returns a success response
-with dry_run=True in the body.
+- DaemonSet pods are ALWAYS skipped during drain — not user-configurable.
+- Cordon label names come from injected strings (sourced from Settings),
+  keeping the service testable without env-var coupling.
+- ``dry_run`` is resolved at the API layer before the service is called.
+- Drain returns ``DrainActionData`` (superset of NodeActionData) including
+  the list of pods that were evicted or deleted.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 
 from kubernetes.client import CoreV1Api, V1Node
 from kubernetes.client.exceptions import ApiException
 
 from app.core.exceptions import KubeApiException, NodeNotFoundException
 from app.domain.kubernetes_models import (
+    DrainActionData,
     DrainOptions,
+    DrainedPodInfo,
     NodeActionData,
+    NodeDetailData,
     NodeInfo,
     NodeListData,
+    NodeMetadataData,
+    PodInfo,
 )
 
 _logger = logging.getLogger(__name__)
 
-# Annotations that identify mirror / static pods — these are not evictable.
+# Annotation that identifies mirror / static pods — not evictable.
 _MIRROR_POD_ANNOTATION = "kubernetes.io/config.mirror"
 
 
 class NodeService:
-    """Implements cordon / uncordon / drain / list operations.
+    """Implements cordon / uncordon / drain / list / label / annotate operations.
 
-    Accepts a ``CoreV1Api`` instance injected by the route handler, which
-    makes the service trivially mockable in unit tests.
+    Args:
+        cordon_label_reason: Value for ``cordon_reason`` label (from Settings).
+        cordon_label_by:     Value for ``cordon_by``     label (from Settings).
     """
+
+    def __init__(
+        self,
+        cordon_label_reason: str = "PM",
+        cordon_label_by: str = "infra",
+    ) -> None:
+        self._cordon_reason = cordon_label_reason
+        self._cordon_by = cordon_label_by
 
     # ── Node listing ──────────────────────────────────────────────────────────
 
     def list_nodes(self, cluster: str, kube: CoreV1Api) -> NodeListData:
-        """Fetch all nodes in the cluster and summarise their status.
+        """Fetch all nodes, including their label map.
 
         Raises:
             KubeApiException: On Kubernetes API failure.
@@ -80,36 +84,94 @@ class NodeService:
         _logger.info("Listed %d node(s) | cluster=%s", len(nodes), cluster)
         return NodeListData(cluster=cluster, nodes=nodes)
 
+    # ── Single node detail ────────────────────────────────────────────────────
+
+    def get_node(self, cluster: str, node_name: str, kube: CoreV1Api) -> NodeDetailData:
+        """Fetch full detail for a single node including all its pods.
+
+        Raises:
+            NodeNotFoundException: If the node does not exist.
+            KubeApiException: On Kubernetes API failure.
+        """
+        try:
+            node = kube.read_node(node_name)
+        except ApiException as exc:
+            if exc.status == 404:
+                raise NodeNotFoundException(
+                    f"Node '{node_name}' not found in cluster '{cluster}'.",
+                ) from exc
+            raise KubeApiException(
+                f"Failed to read node '{node_name}': {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+
+        try:
+            pod_list = kube.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}"
+            )
+        except ApiException as exc:
+            raise KubeApiException(
+                f"Failed to list pods on node '{node_name}': {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+
+        pods = [self._pod_to_info(p) for p in pod_list.items]
+        info = self._node_to_info(node)
+        _logger.info("Got node detail | cluster=%s | node=%s | pods=%d", cluster, node_name, len(pods))
+        return NodeDetailData(
+            cluster=cluster,
+            name=info.name,
+            status=info.status,
+            roles=info.roles,
+            version=info.version,
+            unschedulable=info.unschedulable,
+            labels=info.labels,
+            annotations=info.annotations,
+            pods=pods,
+        )
+
     # ── Cordon ────────────────────────────────────────────────────────────────
 
     def cordon(self, cluster: str, node_name: str, kube: CoreV1Api) -> NodeActionData:
-        """Mark *node_name* as unschedulable (cordon).
+        """Mark *node_name* as unschedulable and stamp cordon labels.
 
-        Also stamps two labels on the node to record who performed the action:
-          - ``cordon=PM``
-          - ``cordon_by=cluster_service``
+        Labels applied (names are configurable via Settings):
+          - ``cordon_reason=<CORDON_LABEL_REASON>``
+          - ``cordon_by=<CORDON_LABEL_BY>``
 
         Raises:
             NodeNotFoundException: If the node does not exist.
             KubeApiException: On Kubernetes API failure.
         """
         self._patch_unschedulable(cluster, node_name, kube, unschedulable=True)
-        self._label_node_cordoned(cluster, node_name, kube)
+        self._patch_labels(
+            cluster,
+            node_name,
+            kube,
+            set_labels={
+                "cordon_reason": self._cordon_reason,
+                "cordon_by": self._cordon_by,
+            },
+        )
         _logger.info("Cordoned node | cluster=%s | node=%s", cluster, node_name)
         return NodeActionData(cluster=cluster, node=node_name, action="cordon")
 
     # ── Uncordon ──────────────────────────────────────────────────────────────
 
-    def uncordon(
-        self, cluster: str, node_name: str, kube: CoreV1Api
-    ) -> NodeActionData:
-        """Re-enable scheduling on *node_name* (uncordon).
+    def uncordon(self, cluster: str, node_name: str, kube: CoreV1Api) -> NodeActionData:
+        """Re-enable scheduling and remove the cordon labels.
 
         Raises:
             NodeNotFoundException: If the node does not exist.
             KubeApiException: On Kubernetes API failure.
         """
         self._patch_unschedulable(cluster, node_name, kube, unschedulable=False)
+        self._patch_labels(
+            cluster,
+            node_name,
+            kube,
+            remove_labels=["cordon_reason", "cordon_by"],
+        )
         _logger.info("Uncordoned node | cluster=%s | node=%s", cluster, node_name)
         return NodeActionData(cluster=cluster, node=node_name, action="uncordon")
 
@@ -121,27 +183,32 @@ class NodeService:
         node_name: str,
         kube: CoreV1Api,
         options: DrainOptions,
-    ) -> NodeActionData:
-        """Drain *node_name*: cordon, then evict/delete eligible pods.
+    ) -> DrainActionData:
+        """Drain *node_name*: cordon → evict/delete eligible pods → return pod list.
+
+        DaemonSet pods are ALWAYS skipped (not configurable).
+        Mirror/static pods are ALWAYS skipped.
+        Completed/failed pods are ALWAYS skipped.
 
         Steps:
-          1. Cordon the node.
-          2. Collect pods running on the node.
-          3. Filter pods that should not be removed (mirror, daemonset, completed).
-          4. Evict or delete each eligible pod.
-          5. Poll until all pods are gone or *timeout_seconds* elapses.
+          1. Cordon the node (unschedulable=True, labels stamped).
+          2. List all pods assigned to the node.
+          3. Filter out ineligible pods.
+          4. Evict (honour PDB) or delete (bypass PDB) each eligible pod.
+          5. Poll until all targeted pods are gone or timeout expires.
+
+        Returns:
+            DrainActionData including the list of pods that were processed.
 
         Raises:
             NodeNotFoundException: Node does not exist.
             KubeApiException: On Kubernetes API failure.
         """
-        # Step 1 — cordon first so no new pods land during drain.
-        self._patch_unschedulable(cluster, node_name, kube, unschedulable=True)
+        # Step 1 — cordon first (stamps labels too).
+        self.cordon(cluster, node_name, kube)
         _logger.info(
             "Draining node | cluster=%s | node=%s | options=%s",
-            cluster,
-            node_name,
-            options.model_dump(),
+            cluster, node_name, options.model_dump(),
         )
 
         # Step 2 — collect pods assigned to this node.
@@ -155,13 +222,11 @@ class NodeService:
                 kube_status=exc.status,
             ) from exc
 
-        # Step 3 — filter: skip mirror pods, completed pods, and optionally daemonsets.
+        # Step 3 — filter ineligible pods.
         pods_to_evict = []
         for pod in pod_list.items:
             annotations = pod.metadata.annotations or {}
-            owner_kinds = [
-                ref.kind for ref in (pod.metadata.owner_references or [])
-            ]
+            owner_kinds = [ref.kind for ref in (pod.metadata.owner_references or [])]
 
             if _MIRROR_POD_ANNOTATION in annotations:
                 _logger.debug("Skipping mirror pod | pod=%s", pod.metadata.name)
@@ -171,34 +236,28 @@ class NodeService:
             if phase in ("succeeded", "failed"):
                 _logger.debug(
                     "Skipping completed pod | pod=%s | phase=%s",
-                    pod.metadata.name,
-                    phase,
+                    pod.metadata.name, phase,
                 )
                 continue
 
-            if "DaemonSet" in owner_kinds and options.ignore_daemonsets:
-                _logger.debug(
-                    "Skipping DaemonSet pod | pod=%s", pod.metadata.name
-                )
+            # DaemonSet pods are ALWAYS skipped — API enforces this.
+            if "DaemonSet" in owner_kinds:
+                _logger.debug("Skipping DaemonSet pod | pod=%s", pod.metadata.name)
                 continue
 
             pods_to_evict.append(pod)
 
         _logger.info(
             "Pods to evict | cluster=%s | node=%s | count=%d",
-            cluster,
-            node_name,
-            len(pods_to_evict),
+            cluster, node_name, len(pods_to_evict),
         )
 
         # Step 4 — evict or delete each pod.
         for pod in pods_to_evict:
-            ns = pod.metadata.namespace
-            name = pod.metadata.name
             self._evict_or_delete(
                 kube=kube,
-                name=name,
-                namespace=ns,
+                name=pod.metadata.name,
+                namespace=pod.metadata.namespace,
                 options=options,
             )
 
@@ -210,10 +269,87 @@ class NodeService:
             timeout_seconds=options.timeout_seconds,
         )
 
-        _logger.info(
-            "Drain complete | cluster=%s | node=%s", cluster, node_name
+        drained_pods = [
+            DrainedPodInfo(name=p.metadata.name, namespace=p.metadata.namespace)
+            for p in pods_to_evict
+        ]
+        _logger.info("Drain complete | cluster=%s | node=%s | drained=%d", cluster, node_name, len(drained_pods))
+        return DrainActionData(
+            cluster=cluster,
+            node=node_name,
+            action="drain",
+            drained_pods=drained_pods,
         )
-        return NodeActionData(cluster=cluster, node=node_name, action="drain")
+
+    # ── Label management ──────────────────────────────────────────────────────
+
+    def label_node(
+        self,
+        cluster: str,
+        node_name: str,
+        kube: CoreV1Api,
+        set_labels: dict[str, str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> NodeMetadataData:
+        """Add / overwrite or remove labels on *node_name*.
+
+        Returns the current labels and annotations after the patch.
+
+        Raises:
+            NodeNotFoundException: Node does not exist.
+            KubeApiException: On Kubernetes API failure.
+        """
+        patched = self._patch_labels(
+            cluster, node_name, kube,
+            set_labels=set_labels, remove_labels=remove_labels,
+        )
+        current_labels, current_annotations = (
+            self._fetch_node_metadata(cluster, node_name, kube) if patched
+            else ({}, {})
+        )
+        _logger.info("Patched labels | cluster=%s | node=%s", cluster, node_name)
+        return NodeMetadataData(
+            cluster=cluster,
+            node=node_name,
+            action="label",
+            labels=current_labels,
+            annotations=current_annotations,
+        )
+
+    # ── Annotation management ─────────────────────────────────────────────────
+
+    def annotate_node(
+        self,
+        cluster: str,
+        node_name: str,
+        kube: CoreV1Api,
+        set_annotations: dict[str, str] | None = None,
+        remove_annotations: list[str] | None = None,
+    ) -> NodeMetadataData:
+        """Add / overwrite or remove annotations on *node_name*.
+
+        Returns the current labels and annotations after the patch.
+
+        Raises:
+            NodeNotFoundException: Node does not exist.
+            KubeApiException: On Kubernetes API failure.
+        """
+        patched = self._patch_annotations(
+            cluster, node_name, kube,
+            set_annotations=set_annotations, remove_annotations=remove_annotations,
+        )
+        current_labels, current_annotations = (
+            self._fetch_node_metadata(cluster, node_name, kube) if patched
+            else ({}, {})
+        )
+        _logger.info("Patched annotations | cluster=%s | node=%s", cluster, node_name)
+        return NodeMetadataData(
+            cluster=cluster,
+            node=node_name,
+            action="annotate",
+            labels=current_labels,
+            annotations=current_annotations,
+        )
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
@@ -227,10 +363,7 @@ class NodeService:
     ) -> None:
         """Patch spec.unschedulable on the node."""
         try:
-            kube.patch_node(
-                node_name,
-                {"spec": {"unschedulable": unschedulable}},
-            )
+            kube.patch_node(node_name, {"spec": {"unschedulable": unschedulable}})
         except ApiException as exc:
             if exc.status == 404:
                 raise NodeNotFoundException(
@@ -241,42 +374,91 @@ class NodeService:
                 kube_status=exc.status,
             ) from exc
 
-    def _label_node_cordoned(
+    def _patch_labels(
         self,
         cluster: str,
         node_name: str,
         kube: CoreV1Api,
-    ) -> None:
-        """Stamp cordon-ownership labels onto the node.
+        set_labels: dict[str, str] | None = None,
+        remove_labels: list[str] | None = None,
+    ) -> bool:
+        """Apply label additions and deletions in a single patch call.
 
-        Labels applied:
-          - ``cordon=PM``              — marks that the cordon was requested
-                                         via the cluster service's PM workflow
-          - ``cordon_by=cluster_service`` — records the actor that performed it
+        Returns True if a patch was actually sent, False when nothing to do.
         """
+        labels: dict[str, str | None] = {}
+        labels.update(set_labels or {})
+        for key in remove_labels or []:
+            labels[key] = None  # null value → Kubernetes deletes the label
+
+        if not labels:
+            return False
+
         try:
-            kube.patch_node(
-                node_name,
-                {
-                    "metadata": {
-                        "labels": {
-                            "cordon": "PM",
-                            "cordon_by": "cluster_service",
-                        }
-                    }
-                },
-            )
-            _logger.debug(
-                "Applied cordon labels | cluster=%s | node=%s",
-                cluster,
-                node_name,
-            )
+            kube.patch_node(node_name, {"metadata": {"labels": labels}})
         except ApiException as exc:
+            if exc.status == 404:
+                raise NodeNotFoundException(
+                    f"Node '{node_name}' not found in cluster '{cluster}'.",
+                ) from exc
             raise KubeApiException(
-                f"Failed to label node '{node_name}' after cordon: {exc.reason}",
+                f"Failed to patch labels on node '{node_name}': {exc.reason}",
                 kube_status=exc.status,
             ) from exc
+        return True
 
+    def _patch_annotations(
+        self,
+        cluster: str,
+        node_name: str,
+        kube: CoreV1Api,
+        set_annotations: dict[str, str] | None = None,
+        remove_annotations: list[str] | None = None,
+    ) -> bool:
+        """Apply annotation additions and deletions in a single patch call.
+
+        Returns True if a patch was actually sent, False when nothing to do.
+        """
+        annotations: dict[str, str | None] = {}
+        annotations.update(set_annotations or {})
+        for key in remove_annotations or []:
+            annotations[key] = None
+
+        if not annotations:
+            return False
+
+        try:
+            kube.patch_node(node_name, {"metadata": {"annotations": annotations}})
+        except ApiException as exc:
+            if exc.status == 404:
+                raise NodeNotFoundException(
+                    f"Node '{node_name}' not found in cluster '{cluster}'.",
+                ) from exc
+            raise KubeApiException(
+                f"Failed to patch annotations on node '{node_name}': {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+        return True
+
+    def _fetch_node_metadata(
+        self,
+        cluster: str,
+        node_name: str,
+        kube: CoreV1Api,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Read the current labels and annotations from the cluster after a patch."""
+        try:
+            node = kube.read_node(node_name)
+        except ApiException as exc:
+            if exc.status == 404:
+                raise NodeNotFoundException(
+                    f"Node '{node_name}' not found in cluster '{cluster}'.",
+                ) from exc
+            raise KubeApiException(
+                f"Failed to read node '{node_name}' after patch: {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+        return (node.metadata.labels or {}, node.metadata.annotations or {})
 
     def _evict_or_delete(
         self,
@@ -292,9 +474,7 @@ class NodeService:
             _logger.debug("Deleting pod | ns=%s | pod=%s", namespace, name)
             try:
                 kube.delete_namespaced_pod(
-                    name=name,
-                    namespace=namespace,
-                    grace_period_seconds=grace,
+                    name=name, namespace=namespace, grace_period_seconds=grace,
                 )
             except ApiException as exc:
                 if exc.status == 404:
@@ -304,34 +484,21 @@ class NodeService:
                     kube_status=exc.status,
                 ) from exc
         else:
-            from kubernetes.client.models import (
-                V1DeleteOptions,
-                V1Eviction,
-                V1ObjectMeta,
-            )
-
+            from kubernetes.client.models import V1DeleteOptions, V1Eviction, V1ObjectMeta
             _logger.debug("Evicting pod | ns=%s | pod=%s", namespace, name)
             eviction = V1Eviction(
                 metadata=V1ObjectMeta(name=name, namespace=namespace),
-                delete_options=V1DeleteOptions(
-                    grace_period_seconds=grace,
-                ),
+                delete_options=V1DeleteOptions(grace_period_seconds=grace),
             )
             try:
-                kube.create_namespaced_pod_eviction(
-                    name=name,
-                    namespace=namespace,
-                    body=eviction,
-                )
+                kube.create_namespaced_pod_eviction(name=name, namespace=namespace, body=eviction)
             except ApiException as exc:
                 if exc.status == 404:
-                    return  # pod already gone
+                    return
                 if exc.status == 429:
-                    # PDB prevents eviction — raise a meaningful error.
                     raise KubeApiException(
-                        f"Pod '{namespace}/{name}' cannot be evicted due to "
-                        "a PodDisruptionBudget. Use disable_eviction=true to "
-                        "bypass (will ignore PDB).",
+                        f"Pod '{namespace}/{name}' cannot be evicted due to a "
+                        "PodDisruptionBudget. Use disable_eviction=true to bypass.",
                         kube_status=409,
                     ) from exc
                 raise KubeApiException(
@@ -343,16 +510,12 @@ class NodeService:
         self,
         kube: CoreV1Api,
         node_name: str,
-        pod_names: set[tuple[str, str]],  # {(namespace, name)}
+        pod_names: set[tuple[str, str]],
         timeout_seconds: int,
     ) -> None:
-        """Poll until all targeted pods have disappeared or timeout expires."""
         if not pod_names:
             return
-
         deadline = time.monotonic() + timeout_seconds
-        poll_interval = 2  # seconds
-
         while time.monotonic() < deadline:
             try:
                 remaining = kube.list_pod_for_all_namespaces(
@@ -372,32 +535,26 @@ class NodeService:
             if not still_present:
                 _logger.debug("All targeted pods are gone | node=%s", node_name)
                 return
-
             _logger.debug(
                 "Waiting for %d pod(s) to terminate | node=%s",
-                len(still_present),
-                node_name,
+                len(still_present), node_name,
             )
-            time.sleep(poll_interval)
+            time.sleep(2)
 
-        # Timeout expired — raise to signal incomplete drain.
         raise KubeApiException(
-            f"Drain timed out after {timeout_seconds}s: some pods are still "
-            f"running on '{node_name}'.",
+            f"Drain timed out after {timeout_seconds}s: some pods are still running on '{node_name}'.",
             kube_status=504,
         )
 
     @staticmethod
     def _node_to_info(node: V1Node) -> NodeInfo:
         """Convert a V1Node object to a NodeInfo response model."""
-        # Determine ready status from conditions
         status = "Unknown"
         for cond in (node.status.conditions or []):
             if cond.type == "Ready":
                 status = "Ready" if cond.status == "True" else "NotReady"
                 break
 
-        # Parse roles from labels: node-role.kubernetes.io/<role>
         labels = node.metadata.labels or {}
         roles = [
             key.split("/")[-1]
@@ -406,9 +563,7 @@ class NodeService:
         ] or ["<none>"]
 
         version = (
-            node.status.node_info.kubelet_version
-            if node.status.node_info
-            else ""
+            node.status.node_info.kubelet_version if node.status.node_info else ""
         )
 
         return NodeInfo(
@@ -417,4 +572,30 @@ class NodeService:
             roles=roles,
             version=version,
             unschedulable=bool(node.spec.unschedulable),
+            labels=labels,
+            annotations=node.metadata.annotations or {},
+        )
+
+    @staticmethod
+    def _pod_to_info(pod) -> PodInfo:
+        """Convert a V1Pod object to a PodInfo summary."""
+        owner_kind: str | None = None
+        if pod.metadata.owner_references:
+            owner_kind = pod.metadata.owner_references[0].kind
+
+        # Sum restarts across all container statuses.
+        restart_count = 0
+        ready = False
+        container_statuses = pod.status.container_statuses or []
+        if container_statuses:
+            restart_count = sum(cs.restart_count or 0 for cs in container_statuses)
+            ready = all(cs.ready for cs in container_statuses)
+
+        return PodInfo(
+            name=pod.metadata.name,
+            namespace=pod.metadata.namespace,
+            phase=pod.status.phase or "Unknown",
+            ready=ready,
+            owner_kind=owner_kind,
+            restart_count=restart_count,
         )
