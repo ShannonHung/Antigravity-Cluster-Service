@@ -302,16 +302,17 @@ class NodeService:
                 options=options,
             )
 
-        # Step 5 — wait for pods to terminate. The router normally resolves the
-        # timeout; coalesce here too so direct service callers get the default.
-        timeout_seconds = options.timeout_seconds
-        if timeout_seconds is None:
-            timeout_seconds = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
+        # Step 5 — wait for pods to terminate. The wait budget is server-owned
+        # (DRAIN_DEFAULT_TIMEOUT_SECONDS), kept below the proxy read timeout so the
+        # app returns a structured 504 instead of a bare proxy 500; the client
+        # cannot set it. On timeout we suggest stronger flags based on `options`.
+        timeout_seconds = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
         self._wait_for_pods_gone(
             kube=kube,
             node_name=node_name,
             pod_names={(p.metadata.namespace, p.metadata.name) for p in pods_to_evict},
             timeout_seconds=timeout_seconds,
+            options=options,
         )
 
         drained_pods = [
@@ -621,6 +622,7 @@ class NodeService:
         node_name: str,
         pod_names: set[tuple[str, str]],
         timeout_seconds: int,
+        options: DrainOptions | None = None,
     ) -> None:
         if not pod_names:
             return
@@ -656,11 +658,13 @@ class NodeService:
             time.sleep(2)
 
         # Timed out — surface a structured 504 (not a proxy 500) that names the
-        # stuck pods and tells the caller drain can be safely retried.
+        # stuck pods, tells the caller drain can be safely retried, and suggests
+        # stronger flags based on the options that were used.
         raise DrainTimeoutException(
             node_name=node_name,
             timeout_seconds=timeout_seconds,
             still_running=list(still_present),
+            current_options=options,
         )
 
     @staticmethod

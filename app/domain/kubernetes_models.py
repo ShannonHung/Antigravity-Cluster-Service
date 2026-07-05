@@ -75,16 +75,11 @@ class DrainOptions(BaseModel):
         description="Override pod termination grace period (--grace-period). "
                     "None means use each pod's own setting.",
     )
-    timeout_seconds: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description=(
-            "Total time to wait for all pods to be deleted (--timeout). "
-            "When omitted, the server's DRAIN_DEFAULT_TIMEOUT_SECONDS is used. "
-            "Note: a value above the front proxy's read timeout risks a bare "
-            "gateway 500 instead of a structured timeout error."
-        ),
-    )
+    # Note: there is no client-settable drain timeout. The wait budget is owned
+    # by the server (DRAIN_DEFAULT_TIMEOUT_SECONDS) and deliberately kept below
+    # the front proxy's read timeout, so the app always returns a structured 504
+    # rather than a bare proxy 500. On timeout the response lists the pods still
+    # running and suggests stronger flags to retry with.
 
 
 class DrainRequest(BaseModel):

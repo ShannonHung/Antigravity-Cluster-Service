@@ -301,7 +301,9 @@ class DrainTimeoutException(BaseAppException):
     drain can be safely retried) instead of a bare gateway 500.
 
     Drain is idempotent: the node stays cordoned, so re-invoking drain simply
-    continues evicting whatever is left.
+    continues evicting whatever is left. When pods refuse to leave under a plain
+    drain, ``detail.suggested_options`` recommends the stronger flags the caller
+    has not enabled yet (force / disable_eviction / grace 0 / delete emptyDir).
     """
 
     http_status = 504
@@ -313,22 +315,57 @@ class DrainTimeoutException(BaseAppException):
         node_name: str,
         timeout_seconds: int,
         still_running: list[tuple[str, str]],
+        current_options: Any = None,
     ) -> None:
         pods = [{"namespace": ns, "name": name} for ns, name in sorted(still_running)]
+        suggested = self._suggest_stronger_options(current_options)
+
         message = (
             f"Drain of node '{node_name}' exceeded {timeout_seconds}s with "
             f"{len(pods)} pod(s) still running. The node remains cordoned; "
             f"you may safely retry the drain to continue evicting the "
             f"remaining pods."
         )
+        if suggested:
+            message += (
+                " If they keep hanging, retry with stronger options: "
+                + ", ".join(f"{k}={v}" for k, v in suggested.items())
+                + "."
+            )
+
         super().__init__(
             message,
             detail={
                 "node": node_name,
                 "timeout_seconds": timeout_seconds,
                 "pods_still_running": pods,
+                "suggested_options": suggested,
             },
         )
+
+    @staticmethod
+    def _suggest_stronger_options(current_options: Any) -> dict:
+        """Recommend the escalation flags the caller has NOT enabled yet.
+
+        Given the options used on the timed-out drain, offer only the stronger
+        settings that would actually add force — so an already-forceful request
+        is not told to re-enable what it already set.
+        """
+        force = bool(getattr(current_options, "force", False))
+        disable_eviction = bool(getattr(current_options, "disable_eviction", False))
+        grace = getattr(current_options, "grace_period_seconds", None)
+        delete_emptydir = bool(getattr(current_options, "delete_emptydir_data", False))
+
+        suggested: dict = {}
+        if not force:
+            suggested["force"] = True
+        if not disable_eviction:
+            suggested["disable_eviction"] = True
+        if grace != 0:
+            suggested["grace_period_seconds"] = 0
+        if not delete_emptydir:
+            suggested["delete_emptydir_data"] = True
+        return suggested
 
 
 # ──────────────────────────────────────────────────────────────────────────────

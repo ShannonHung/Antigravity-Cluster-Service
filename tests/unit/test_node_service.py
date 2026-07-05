@@ -278,57 +278,85 @@ def test_drain_raises_on_pod_list_failure():
         _svc().drain("test", "worker-1", kube, DrainOptions())
 
 
+def _timeout_setup(monkeypatch, default: float) -> MagicMock:
+    """Build a kube whose target pod never disappears and freeze the clock so the
+    drain deadline (settings-driven) expires on the first wait-loop check."""
+    kube = _make_kube()
+    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
+    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
+    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
+    times = iter([0.0, float(default) + 1.0])  # start, then past-deadline
+    monkeypatch.setattr(
+        "app.services.node_service.time.monotonic",
+        lambda: next(times, 9999.0),
+    )
+    return kube
+
+
 def test_drain_raises_drain_timeout_when_pods_never_terminate(monkeypatch):
     """When a targeted pod never disappears, drain must raise a structured
     DrainTimeoutException (504) that names the stuck pod and hints at retry —
-    not a bare KubeApiException nor a proxy-level 500."""
-    kube = _make_kube()
-    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
-    # Listing (step 2) returns the pod; every subsequent wait-loop poll keeps
-    # returning it, so it is never considered gone.
-    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
+    not a bare KubeApiException nor a proxy-level 500. The timeout budget comes
+    from settings; the client can no longer set it."""
+    from app.core.config import get_settings
 
-    # Don't actually sleep, and force the deadline to expire immediately.
-    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
-    times = iter([0.0, 100.0, 200.0])  # start, then past-deadline on first check
-    monkeypatch.setattr(
-        "app.services.node_service.time.monotonic",
-        lambda: next(times, 999.0),
-    )
+    get_settings.cache_clear()
+    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
+    kube = _timeout_setup(monkeypatch, default)
 
     with pytest.raises(DrainTimeoutException) as exc_info:
-        _svc().drain("test", "worker-1", kube, DrainOptions(timeout_seconds=5))
+        _svc().drain("test", "worker-1", kube, DrainOptions())
 
     exc = exc_info.value
     assert exc.http_status == 504
+    # Timeout budget is the server default, not client-controlled.
+    assert exc.detail["timeout_seconds"] == default
     # The stuck pod is reported in the structured detail.
     assert "stuck-pod" in str(exc.detail)
     # The message tells the user drain can be safely retried.
     assert "retry" in exc.message.lower() or "again" in exc.message.lower()
 
 
-def test_drain_uses_default_timeout_when_options_omit_it(monkeypatch):
-    """When DrainOptions.timeout_seconds is None (the request omitted it), the
-    service falls back to DRAIN_DEFAULT_TIMEOUT_SECONDS from settings."""
+def test_drain_timeout_suggests_stronger_options(monkeypatch):
+    """On timeout with a plain drain, the response suggests the stronger flags
+    the caller hasn't enabled yet (force / disable_eviction / grace 0 / emptydir)."""
     from app.core.config import get_settings
 
     get_settings.cache_clear()
     default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
-
-    kube = _make_kube()
-    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
-    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
-    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
-    times = iter([0.0, float(default) + 1.0])  # expire immediately on first check
-    monkeypatch.setattr(
-        "app.services.node_service.time.monotonic",
-        lambda: next(times, 999.0),
-    )
+    kube = _timeout_setup(monkeypatch, default)
 
     with pytest.raises(DrainTimeoutException) as exc_info:
-        _svc().drain("test", "worker-1", kube, DrainOptions())  # timeout_seconds=None
+        _svc().drain("test", "worker-1", kube, DrainOptions())
 
-    assert exc_info.value.detail["timeout_seconds"] == default
+    suggested = exc_info.value.detail["suggested_options"]
+    # A plain drain hasn't enabled any of the escalations, so all are suggested.
+    assert suggested["force"] is True
+    assert suggested["disable_eviction"] is True
+    assert suggested["grace_period_seconds"] == 0
+    assert suggested["delete_emptydir_data"] is True
+
+
+def test_drain_timeout_omits_already_enabled_options(monkeypatch):
+    """Flags the caller already set are not re-suggested — only what would add force."""
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
+    kube = _timeout_setup(monkeypatch, default)
+
+    with pytest.raises(DrainTimeoutException) as exc_info:
+        _svc().drain(
+            "test", "worker-1", kube,
+            DrainOptions(force=True, disable_eviction=True),
+        )
+
+    suggested = exc_info.value.detail["suggested_options"]
+    # force / disable_eviction already on → not repeated; the rest still offered.
+    assert "force" not in suggested
+    assert "disable_eviction" not in suggested
+    assert suggested["grace_period_seconds"] == 0
+    assert suggested["delete_emptydir_data"] is True
 
 
 # ── label_node ────────────────────────────────────────────────────────────────
