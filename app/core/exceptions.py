@@ -68,6 +68,7 @@ class ErrorCode(StrEnum):
     NODE_NOT_FOUND             = "NODE_NOT_FOUND"
     NODE_OPERATION_FAILED      = "NODE_OPERATION_FAILED"
     KUBE_API_ERROR             = "KUBE_API_ERROR"
+    DRAIN_TIMEOUT              = "DRAIN_TIMEOUT"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -290,6 +291,44 @@ class KubeApiException(BaseAppException):
         # otherwise default to 502 (bad gateway from the K8s control plane).
         self.http_status = kube_status if kube_status >= 400 else 502
         super().__init__(message, **kwargs)
+
+
+class DrainTimeoutException(BaseAppException):
+    """Raised when a node drain does not finish within its timeout budget.
+
+    The app deliberately times out *before* any front proxy would, so the caller
+    receives this structured 504 (naming the pods still running and hinting that
+    drain can be safely retried) instead of a bare gateway 500.
+
+    Drain is idempotent: the node stays cordoned, so re-invoking drain simply
+    continues evicting whatever is left.
+    """
+
+    http_status = 504
+    error_code = ErrorCode.DRAIN_TIMEOUT
+    log_level = logging.WARNING
+
+    def __init__(
+        self,
+        node_name: str,
+        timeout_seconds: int,
+        still_running: list[tuple[str, str]],
+    ) -> None:
+        pods = [{"namespace": ns, "name": name} for ns, name in sorted(still_running)]
+        message = (
+            f"Drain of node '{node_name}' exceeded {timeout_seconds}s with "
+            f"{len(pods)} pod(s) still running. The node remains cordoned; "
+            f"you may safely retry the drain to continue evicting the "
+            f"remaining pods."
+        )
+        super().__init__(
+            message,
+            detail={
+                "node": node_name,
+                "timeout_seconds": timeout_seconds,
+                "pods_still_running": pods,
+            },
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

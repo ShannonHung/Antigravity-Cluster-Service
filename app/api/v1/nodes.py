@@ -164,9 +164,18 @@ async def drain_node(
             request_id=_request_id(request),
         )
 
+    # Resolve the effective drain timeout: honour an explicit per-request value,
+    # otherwise fall back to the server default (kept below the proxy timeout so
+    # the app returns a structured 504 rather than a bare proxy 500).
+    options = body.options
+    if options.timeout_seconds is None:
+        options = options.model_copy(
+            update={"timeout_seconds": get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS}
+        )
+
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.drain(cluster=cluster, node_name=node, kube=kube, options=body.options)
+    data = svc.drain(cluster=cluster, node_name=node, kube=kube, options=options)
     return ApiResponse(data=data, request_id=_request_id(request))
 
 

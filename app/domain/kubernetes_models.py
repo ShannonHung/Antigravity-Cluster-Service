@@ -75,10 +75,15 @@ class DrainOptions(BaseModel):
         description="Override pod termination grace period (--grace-period). "
                     "None means use each pod's own setting.",
     )
-    timeout_seconds: int = Field(
-        default=300,
+    timeout_seconds: Optional[int] = Field(
+        default=None,
         ge=1,
-        description="Total time to wait for all pods to be deleted (--timeout).",
+        description=(
+            "Total time to wait for all pods to be deleted (--timeout). "
+            "When omitted, the server's DRAIN_DEFAULT_TIMEOUT_SECONDS is used. "
+            "Note: a value above the front proxy's read timeout risks a bare "
+            "gateway 500 instead of a structured timeout error."
+        ),
     )
 
 

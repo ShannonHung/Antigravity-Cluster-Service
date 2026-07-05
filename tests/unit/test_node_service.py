@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, call
 import pytest
 from kubernetes.client.exceptions import ApiException
 
-from app.core.exceptions import KubeApiException, NodeNotFoundException
+from app.core.exceptions import DrainTimeoutException, KubeApiException, NodeNotFoundException
 from app.domain.kubernetes_models import DrainActionData, DrainOptions, NodeActionData, NodeListData, NodeTaintData, PodListData, TaintRemoveSpec, TaintSpec
 from app.services.node_service import NodeService
 
@@ -276,6 +276,59 @@ def test_drain_raises_on_pod_list_failure():
     kube.list_pod_for_all_namespaces.side_effect = _api_error(500)
     with pytest.raises(KubeApiException):
         _svc().drain("test", "worker-1", kube, DrainOptions())
+
+
+def test_drain_raises_drain_timeout_when_pods_never_terminate(monkeypatch):
+    """When a targeted pod never disappears, drain must raise a structured
+    DrainTimeoutException (504) that names the stuck pod and hints at retry —
+    not a bare KubeApiException nor a proxy-level 500."""
+    kube = _make_kube()
+    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
+    # Listing (step 2) returns the pod; every subsequent wait-loop poll keeps
+    # returning it, so it is never considered gone.
+    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
+
+    # Don't actually sleep, and force the deadline to expire immediately.
+    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
+    times = iter([0.0, 100.0, 200.0])  # start, then past-deadline on first check
+    monkeypatch.setattr(
+        "app.services.node_service.time.monotonic",
+        lambda: next(times, 999.0),
+    )
+
+    with pytest.raises(DrainTimeoutException) as exc_info:
+        _svc().drain("test", "worker-1", kube, DrainOptions(timeout_seconds=5))
+
+    exc = exc_info.value
+    assert exc.http_status == 504
+    # The stuck pod is reported in the structured detail.
+    assert "stuck-pod" in str(exc.detail)
+    # The message tells the user drain can be safely retried.
+    assert "retry" in exc.message.lower() or "again" in exc.message.lower()
+
+
+def test_drain_uses_default_timeout_when_options_omit_it(monkeypatch):
+    """When DrainOptions.timeout_seconds is None (the request omitted it), the
+    service falls back to DRAIN_DEFAULT_TIMEOUT_SECONDS from settings."""
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
+
+    kube = _make_kube()
+    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
+    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
+    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
+    times = iter([0.0, float(default) + 1.0])  # expire immediately on first check
+    monkeypatch.setattr(
+        "app.services.node_service.time.monotonic",
+        lambda: next(times, 999.0),
+    )
+
+    with pytest.raises(DrainTimeoutException) as exc_info:
+        _svc().drain("test", "worker-1", kube, DrainOptions())  # timeout_seconds=None
+
+    assert exc_info.value.detail["timeout_seconds"] == default
 
 
 # ── label_node ────────────────────────────────────────────────────────────────
