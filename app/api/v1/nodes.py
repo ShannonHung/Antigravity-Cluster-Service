@@ -164,6 +164,8 @@ async def drain_node(
             request_id=_request_id(request),
         )
 
+    # The drain wait budget is server-owned (DRAIN_DEFAULT_TIMEOUT_SECONDS) and
+    # resolved inside the service — the client cannot set a per-request timeout.
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = svc.drain(cluster=cluster, node_name=node, kube=kube, options=body.options)
