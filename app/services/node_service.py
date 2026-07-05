@@ -29,7 +29,12 @@ from kubernetes.client import CoreV1Api, V1Node
 from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
-from app.core.exceptions import KubeApiException, NodeNotFoundException
+from app.core.config import get_settings
+from app.core.exceptions import (
+    DrainTimeoutException,
+    KubeApiException,
+    NodeNotFoundException,
+)
 from app.domain.kubernetes_models import (
     DrainActionData,
     DrainOptions,
@@ -297,12 +302,17 @@ class NodeService:
                 options=options,
             )
 
-        # Step 5 — wait for pods to terminate.
+        # Step 5 — wait for pods to terminate. The wait budget is server-owned
+        # (DRAIN_DEFAULT_TIMEOUT_SECONDS), kept below the proxy read timeout so the
+        # app returns a structured 504 instead of a bare proxy 500; the client
+        # cannot set it. On timeout we suggest stronger flags based on `options`.
+        timeout_seconds = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
         self._wait_for_pods_gone(
             kube=kube,
             node_name=node_name,
             pod_names={(p.metadata.namespace, p.metadata.name) for p in pods_to_evict},
-            timeout_seconds=options.timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            options=options,
         )
 
         drained_pods = [
@@ -612,10 +622,12 @@ class NodeService:
         node_name: str,
         pod_names: set[tuple[str, str]],
         timeout_seconds: int,
+        options: DrainOptions | None = None,
     ) -> None:
         if not pod_names:
             return
         deadline = time.monotonic() + timeout_seconds
+        still_present: set[tuple[str, str]] = set(pod_names)
         while time.monotonic() < deadline:
             try:
                 remaining = kube.list_pod_for_all_namespaces(
@@ -645,9 +657,14 @@ class NodeService:
             )
             time.sleep(2)
 
-        raise KubeApiException(
-            f"Drain timed out after {timeout_seconds}s: some pods are still running on '{node_name}'.",
-            kube_status=504,
+        # Timed out — surface a structured 504 (not a proxy 500) that names the
+        # stuck pods, tells the caller drain can be safely retried, and suggests
+        # stronger flags based on the options that were used.
+        raise DrainTimeoutException(
+            node_name=node_name,
+            timeout_seconds=timeout_seconds,
+            still_running=list(still_present),
+            current_options=options,
         )
 
     @staticmethod

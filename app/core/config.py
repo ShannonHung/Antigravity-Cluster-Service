@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # Override at runtime: KUBECONFIG_BASE_PATH=/etc/kubeconfigs
     KUBECONFIG_BASE_PATH: str = "data/kubeconfigs"
 
+    # Default budget (seconds) a node drain waits for pods to terminate before
+    # returning a structured 504. Kept conservatively low so the app times out
+    # BEFORE any front proxy would (a longer proxy timeout yields a bare 500);
+    # raise this only in lockstep with the proxy's read timeout.
+    DRAIN_DEFAULT_TIMEOUT_SECONDS: int = 25
+
     # ── Deploy Service ────────────────────────────────────────────────────────
     DEPLOY_SERVICE_URL: str = "http://localhost:8001"
     DEPLOY_SERVICE_USERNAME: str = "cluster-service"
