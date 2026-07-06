@@ -100,7 +100,7 @@ async def execute_command(
     svc: CommandService = Depends(_get_command_service),
     current_user: Annotated[User, Depends(get_current_user(["command_api"]))] = None,
 ) -> ApiResponse[CommandExecutionResponse]:
-    data = await svc.execute(body)
+    data = await svc.execute_command(body)
     return ApiResponse(data=data, request_id=_request_id(request))
 
 

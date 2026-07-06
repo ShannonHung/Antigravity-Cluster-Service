@@ -47,7 +47,7 @@ async def test_get_all_commands_delegates():
 async def test_execute_delegates_and_passes_body():
     svc = _service()
     body = CommandExecutionRequest(command_name="run_ansible", host="1.2.3.4", username="root")
-    resp = await svc.execute(body)
+    resp = await svc.execute_command(body)
     assert resp.command_id == "abc"
     svc._client.execute_command.assert_awaited_once_with(body)
 

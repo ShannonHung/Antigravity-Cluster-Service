@@ -51,6 +51,7 @@ class ErrorCode(StrEnum):
 
     # ── Command (SSH command proxy) ───────────────────────────────────────────
     COMMAND_EXECUTION_FAILED   = "COMMAND_EXECUTION_FAILED"
+    SCRIPT_VERSION_MISMATCH    = "SCRIPT_VERSION_MISMATCH"
 
     # ── Deploy-service level ──────────────────────────────────────────────────
     DEPLOY_SERVICE_UNAVAILABLE = "DEPLOY_SERVICE_UNAVAILABLE"
@@ -165,6 +166,7 @@ _DEPLOY_CODE_MAP: dict[str, ErrorCode] = {
     "AUTH_ERROR": ErrorCode.DEPLOY_SERVICE_AUTH_ERROR,
     "FORBIDDEN":  ErrorCode.DEPLOY_SERVICE_FORBIDDEN,
     "COMMAND_EXECUTION_ERROR": ErrorCode.COMMAND_EXECUTION_FAILED,
+    "SCRIPT_VERSION_MISMATCH": ErrorCode.SCRIPT_VERSION_MISMATCH,
 }
 
 # Fallback: map HTTP status → ErrorCode when response body is absent or unrecognised.
@@ -173,6 +175,7 @@ _DEPLOY_STATUS_MAP: dict[int, ErrorCode] = {
     403: ErrorCode.DEPLOY_SERVICE_FORBIDDEN,
     404: ErrorCode.PIPELINE_NOT_FOUND,
     409: ErrorCode.PIPELINE_CONFLICT,
+    412: ErrorCode.SCRIPT_VERSION_MISMATCH,
     503: ErrorCode.DEPLOY_SERVICE_UNAVAILABLE,
 }
 

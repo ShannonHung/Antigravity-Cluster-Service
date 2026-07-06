@@ -49,6 +49,11 @@ class CommandWhitelistConfig(BaseModel):
     disconnects_ssh: bool = False
     killable: bool = False
     logged: bool = False
+    # Script-version pre-check (mirrored from deploy-service). cluster-service
+    # only surfaces these in the /command/.../info responses it proxies; the
+    # actual version check runs on deploy-service, so no validator is mirrored.
+    checks_script_version: bool = False
+    min_script_version: Optional[str] = None
     pipeline: List[PipelineStep]
     arguments: List[CommandArgumentConfig] = []
 
@@ -77,6 +82,10 @@ class CommandExecutionRequest(BaseModel):
     ssh_config: str = "default"
     option: Optional[CommandOption] = Field(default_factory=CommandOption)
     arguments: Dict[str, Any] = Field(default_factory=dict)
+    # Optional caller-supplied version floor, forwarded verbatim to
+    # deploy-service (may only RAISE the whitelist minimum). Validation of the
+    # semver string happens upstream on deploy-service.
+    min_script_version: Optional[str] = None
 
 
 class CommandExecutionResponse(BaseModel):
@@ -105,6 +114,10 @@ class CommandTraceResponse(BaseModel):
     total_size: int = 0
     size_warning: bool = False
     too_large: bool = False
+    # True when the command was not run with ``logged: true``, so no run log
+    # exists on deploy-service's control_node and the viewer has nothing to
+    # stream. The UI shows an explanatory notice instead of polling forever.
+    not_logged: bool = False
     log_host: Optional[str] = None
     log_port: Optional[int] = None
     log_user: Optional[str] = None

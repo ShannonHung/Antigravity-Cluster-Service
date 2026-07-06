@@ -27,7 +27,7 @@ def fake_service():
     svc.get_all_commands = AsyncMock(
         return_value=UserCommandWhitelist(name="cluster_proxy", allow_commands=[])
     )
-    svc.execute = AsyncMock(
+    svc.execute_command = AsyncMock(
         return_value=CommandExecutionResponse(command_id="abc", status="running")
     )
     svc.get_result = AsyncMock(
