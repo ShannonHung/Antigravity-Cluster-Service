@@ -290,6 +290,10 @@ class KubeApiException(BaseAppException):
     log_level = logging.ERROR
 
     def __init__(self, message: str, *, kube_status: int = 502, **kwargs) -> None:
+        # Preserve the status the API server actually returned. It can differ
+        # from http_status (which floors to 502), and callers rely on the raw
+        # value to tell a retryable 503 from a 403.
+        self.kube_status = kube_status
         # Use the Kubernetes API status as our HTTP status when it makes sense;
         # otherwise default to 502 (bad gateway from the K8s control plane).
         self.http_status = kube_status if kube_status >= 400 else 502

@@ -36,6 +36,9 @@ from app.core.exceptions import (
     NodeNotFoundException,
 )
 from app.domain.kubernetes_models import (
+    BatchNodeActionData,
+    BatchNodeResult,
+    BatchSummary,
     DrainActionData,
     DrainOptions,
     DrainedPodInfo,
@@ -59,11 +62,18 @@ _MIRROR_POD_ANNOTATION = "kubernetes.io/config.mirror"
 
 
 def _connection_error(cluster: str, exc: Urllib3HTTPError) -> KubeApiException:
-    """Convert a urllib3 network error to a KubeApiException(503)."""
-    return KubeApiException(
+    """Convert a urllib3 network error to a KubeApiException(503).
+
+    Tagged ``cluster_level`` so batch operations can tell an unreachable
+    cluster apart from a per-node failure and propagate it instead of
+    reporting it once per node.
+    """
+    err = KubeApiException(
         f"Cannot reach cluster '{cluster}': {exc}",
         kube_status=503,
     )
+    err.cluster_level = True
+    return err
 
 
 class NodeService:
@@ -213,6 +223,109 @@ class NodeService:
         self._patch_unschedulable(cluster, node_name, kube, unschedulable=False)
         _logger.info("Uncordoned node | cluster=%s | node=%s", cluster, node_name)
         return NodeActionData(cluster=cluster, node=node_name, action="uncordon")
+
+    # ── Batch cordon / uncordon ───────────────────────────────────────────────
+
+    def cordon_many(
+        self,
+        cluster: str,
+        node_names: list[str],
+        kube: CoreV1Api,
+    ) -> BatchNodeActionData:
+        """Cordon several nodes, reporting a result for each.
+
+        Node-level failures are collected into the response; they never abort
+        the batch. Cluster-level failures (unreachable API server) propagate.
+        """
+        return self._batch_set_unschedulable(
+            cluster, node_names, kube, unschedulable=True, action="cordon",
+        )
+
+    def uncordon_many(
+        self,
+        cluster: str,
+        node_names: list[str],
+        kube: CoreV1Api,
+    ) -> BatchNodeActionData:
+        """Uncordon several nodes, reporting a result for each.
+
+        Node-level failures are collected into the response; they never abort
+        the batch. Cluster-level failures (unreachable API server) propagate.
+        """
+        return self._batch_set_unschedulable(
+            cluster, node_names, kube, unschedulable=False, action="uncordon",
+        )
+
+    @staticmethod
+    def _is_cluster_level(exc: Exception) -> bool:
+        """True when a failure is about the cluster, not the individual node.
+
+        Reporting these per node would tell the caller "these N nodes are bad"
+        when the real answer is "the cluster is unreachable" or "your
+        credentials are dead" — so a batch propagates them instead.
+        """
+        if getattr(exc, "cluster_level", False):
+            return True
+        # 401/403 come from the API server, so they arrive untagged — but they
+        # are a property of the connection, and will repeat for every node.
+        return getattr(exc, "kube_status", None) in (401, 403)
+
+    def _batch_set_unschedulable(
+        self,
+        cluster: str,
+        node_names: list[str],
+        kube: CoreV1Api,
+        *,
+        unschedulable: bool,
+        action: str,
+    ) -> BatchNodeActionData:
+        """Shared batch loop for cordon_many / uncordon_many.
+
+        Nodes are de-duplicated (first-seen order kept) so ``results`` is safe
+        to key by node name. Execution is sequential: Kubernetes offers no
+        transaction across N node patches, so concurrency would only add
+        API-server load to an already-cheap operation.
+
+        Only per-node failures are captured into ``results``. Cluster-level
+        failures — an unreachable API server, bad credentials — propagate, so
+        callers can tell "the cluster is down" from "these nodes are bad"
+        instead of reading N identical per-node errors. Any unexpected
+        exception type propagates too, rather than being silently downgraded.
+        """
+        results: list[BatchNodeResult] = []
+
+        for node_name in dict.fromkeys(node_names):
+            try:
+                self._patch_unschedulable(
+                    cluster, node_name, kube, unschedulable=unschedulable,
+                )
+                results.append(BatchNodeResult(node=node_name, status="success"))
+            except (NodeNotFoundException, KubeApiException) as exc:
+                if self._is_cluster_level(exc):
+                    raise
+                # NodeNotFoundException carries no kube_status of its own — it is
+                # only ever raised on a 404, so fall back to the app-level status.
+                results.append(
+                    BatchNodeResult(
+                        node=node_name,
+                        status="failed",
+                        error_code=str(exc.error_code),
+                        message=str(exc),
+                        kube_status=getattr(exc, "kube_status", None) or exc.http_status,
+                    )
+                )
+
+        succeeded = sum(1 for r in results if r.status == "success")
+        return BatchNodeActionData(
+            cluster=cluster,
+            action=action,
+            summary=BatchSummary(
+                total=len(results),
+                succeeded=succeeded,
+                failed=len(results) - succeeded,
+            ),
+            results=results,
+        )
 
     # ── Drain ─────────────────────────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 from kubernetes.client.exceptions import ApiException
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from app.core.exceptions import DrainTimeoutException, KubeApiException, NodeNotFoundException
 from app.domain.kubernetes_models import DrainActionData, DrainOptions, NodeActionData, NodeListData, NodeTaintData, PodListData, TaintRemoveSpec, TaintSpec
@@ -686,3 +687,101 @@ def test_taint_node_raises_kube_api_exception_on_patch_500():
             set_taints=[TaintSpec(key="gpu", effect="NoSchedule")],
             remove_taints=[],
         )
+
+
+# ── cordon_many / uncordon_many ───────────────────────────────────────────────
+
+def test_cordon_many_all_succeed():
+    kube = _make_kube()
+    result = _svc().cordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
+
+    assert result.cluster == "test"
+    assert result.action == "cordon"
+    assert result.summary.total == 2
+    assert result.summary.succeeded == 2
+    assert result.summary.failed == 0
+    assert [r.node for r in result.results] == ["n1", "n2"]
+    assert all(r.status == "success" for r in result.results)
+
+
+def test_cordon_many_partial_failure_keeps_going():
+    kube = _make_kube()
+    kube.patch_node.side_effect = [None, _api_error(404, "Not Found"), None]
+
+    result = _svc().cordon_many(cluster="test", node_names=["n1", "n2", "n3"], kube=kube)
+
+    assert result.summary.total == 3
+    assert result.summary.succeeded == 2
+    assert result.summary.failed == 1
+
+    failed = [r for r in result.results if r.status == "failed"]
+    assert len(failed) == 1
+    assert failed[0].node == "n2"
+    assert failed[0].error_code == "NODE_NOT_FOUND"
+    assert failed[0].kube_status == 404
+    assert "n2" in failed[0].message
+
+    # The node after the failure was still attempted.
+    assert [r.node for r in result.results] == ["n1", "n2", "n3"]
+    assert result.results[2].status == "success"
+
+
+def test_cordon_many_api_error_carries_underlying_status():
+    kube = _make_kube()
+    kube.patch_node.side_effect = _api_error(503, "Service Unavailable")
+
+    result = _svc().cordon_many(cluster="test", node_names=["n1"], kube=kube)
+
+    assert result.summary.failed == 1
+    assert result.results[0].error_code == "KUBE_API_ERROR"
+    assert result.results[0].kube_status == 503
+
+
+def test_cordon_many_deduplicates_node_names():
+    kube = _make_kube()
+
+    result = _svc().cordon_many(cluster="test", node_names=["n1", "n2", "n1"], kube=kube)
+
+    assert result.summary.total == 2
+    assert [r.node for r in result.results] == ["n1", "n2"]
+    assert kube.patch_node.call_count == 2
+
+
+def test_uncordon_many_patches_unschedulable_false():
+    kube = _make_kube()
+
+    result = _svc().uncordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
+
+    assert result.action == "uncordon"
+    assert result.summary.succeeded == 2
+    kube.patch_node.assert_has_calls([
+        call("n1", {"spec": {"unschedulable": False}}),
+        call("n2", {"spec": {"unschedulable": False}}),
+    ])
+
+
+def test_cordon_many_patches_unschedulable_true():
+    kube = _make_kube()
+
+    _svc().cordon_many(cluster="test", node_names=["n1"], kube=kube)
+
+    kube.patch_node.assert_called_once_with("n1", {"spec": {"unschedulable": True}})
+
+
+def test_cordon_many_propagates_cluster_connection_failure():
+    """A cluster-level failure must not be downgraded to N per-node failures."""
+    kube = _make_kube()
+    kube.patch_node.side_effect = Urllib3HTTPError("connection refused")
+
+    with pytest.raises(KubeApiException):
+        _svc().cordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_cordon_many_propagates_auth_failure(status):
+    """Bad credentials are a cluster-level failure, not N broken nodes."""
+    kube = _make_kube()
+    kube.patch_node.side_effect = _api_error(status, "Unauthorized")
+
+    with pytest.raises(KubeApiException):
+        _svc().cordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)

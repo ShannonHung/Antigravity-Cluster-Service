@@ -8,6 +8,8 @@ Routes:
   POST  /api/v1/clusters/{cluster}/nodes/{node}/cordon      → cordon a node
   POST  /api/v1/clusters/{cluster}/nodes/{node}/uncordon    → uncordon a node
   POST  /api/v1/clusters/{cluster}/nodes/{node}/drain       → drain a node
+  POST  /api/v1/clusters/{cluster}/nodes:cordon             → cordon several nodes (batch)
+  POST  /api/v1/clusters/{cluster}/nodes:uncordon           → uncordon several nodes (batch)
   PATCH /api/v1/clusters/{cluster}/nodes/{node}/labels      → set/remove labels
   PATCH /api/v1/clusters/{cluster}/nodes/{node}/annotations → set/remove annotations
   PATCH /api/v1/clusters/{cluster}/nodes/{node}/taints      → set/remove taints
@@ -17,6 +19,7 @@ All endpoints require the ``cluster_api`` scope.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -25,6 +28,8 @@ from fastapi import APIRouter, Depends, Request
 from app.core.config import get_settings
 from app.core.dependencies import get_current_user
 from app.domain.kubernetes_models import (
+    BatchNodeActionData,
+    BatchNodeRequest,
     DrainActionData,
     DrainRequest,
     NodeActionData,
@@ -127,6 +132,111 @@ async def uncordon_node(
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = svc.uncordon(cluster=cluster, node_name=node, kube=kube)
+    return ApiResponse(data=data, request_id=_request_id(request))
+
+
+# ── POST …/nodes:cordon ───────────────────────────────────────────────────────
+
+@router.post(
+    "/{cluster}/nodes:cordon",
+    response_model=ApiResponse[BatchNodeActionData],
+    summary="Cordon several nodes",
+    description=(
+        "Marks each listed node as unschedulable. Always returns 200 when the "
+        "cluster itself is reachable — per-node outcomes are reported in "
+        "``results``, so a failed node never hides the nodes that succeeded.\n\n"
+        "Duplicate names are de-duplicated. Cluster-level failures (unknown "
+        "cluster, unreachable API server) are returned as a normal error "
+        "response instead, since no node was attempted."
+    ),
+)
+async def cordon_nodes(
+    request: Request,
+    cluster: str,
+    body: BatchNodeRequest,
+    current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))],
+    repo: ClusterRepository = Depends(_get_cluster_repo),
+    svc: NodeService = Depends(_get_node_service),
+) -> ApiResponse[BatchNodeActionData]:
+    return await _run_batch(
+        request=request,
+        cluster=cluster,
+        body=body,
+        user=current_user,
+        repo=repo,
+        svc=svc,
+        action="cordon",
+    )
+
+
+# ── POST …/nodes:uncordon ─────────────────────────────────────────────────────
+
+@router.post(
+    "/{cluster}/nodes:uncordon",
+    response_model=ApiResponse[BatchNodeActionData],
+    summary="Uncordon several nodes",
+    description=(
+        "Re-enables scheduling on each listed node. Response semantics match "
+        "the batch cordon endpoint."
+    ),
+)
+async def uncordon_nodes(
+    request: Request,
+    cluster: str,
+    body: BatchNodeRequest,
+    current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))],
+    repo: ClusterRepository = Depends(_get_cluster_repo),
+    svc: NodeService = Depends(_get_node_service),
+) -> ApiResponse[BatchNodeActionData]:
+    return await _run_batch(
+        request=request,
+        cluster=cluster,
+        body=body,
+        user=current_user,
+        repo=repo,
+        svc=svc,
+        action="uncordon",
+    )
+
+
+async def _run_batch(
+    *,
+    request: Request,
+    cluster: str,
+    body: BatchNodeRequest,
+    user: User,
+    repo: ClusterRepository,
+    svc: NodeService,
+    action: str,
+) -> ApiResponse[BatchNodeActionData]:
+    """Shared body for the two batch routes.
+
+    NodeService is synchronous (blocking kubernetes client), so the batch runs
+    on a worker thread — otherwise a batch of N nodes would block the event
+    loop for N round-trips and the process would serve no other request,
+    health checks included, while it ran.
+    """
+    cfg = repo.get_kube_client_config(cluster)
+    kube = KubeClientFactory().get_core_v1(cfg)
+    batch = svc.cordon_many if action == "cordon" else svc.uncordon_many
+
+    data = await asyncio.to_thread(
+        batch, cluster=cluster, node_names=body.nodes, kube=kube,
+    )
+
+    failed = [r.node for r in data.results if r.status == "failed"]
+    _logger.info(
+        "Batch %s | user=%s | cluster=%s | requested=%d | succeeded=%d | "
+        "failed=%d | failed_nodes=%s | reason=%s",
+        action,
+        user.account,
+        cluster,
+        data.summary.total,
+        data.summary.succeeded,
+        data.summary.failed,
+        failed,
+        body.reason,
+    )
     return ApiResponse(data=data, request_id=_request_id(request))
 
 
