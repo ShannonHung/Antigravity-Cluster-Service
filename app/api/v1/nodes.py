@@ -89,7 +89,9 @@ async def get_node(
 ) -> ApiResponse[NodeDetailData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.get_node(cluster=cluster, node_name=node, kube=kube)
+    data = await asyncio.to_thread(
+        svc.get_node, cluster=cluster, node_name=node, kube=kube,
+    )
     return ApiResponse(data=data, request_id=_request_id(request))
 
 # ── POST …/cordon ─────────────────────────────────────────────────────────────
@@ -110,7 +112,9 @@ async def cordon_node(
 ) -> ApiResponse[NodeActionData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.cordon(cluster=cluster, node_name=node, kube=kube)
+    data = await asyncio.to_thread(
+        svc.cordon, cluster=cluster, node_name=node, kube=kube,
+    )
     return ApiResponse(data=data, request_id=_request_id(request))
 
 # ── POST …/uncordon ───────────────────────────────────────────────────────────
@@ -131,7 +135,9 @@ async def uncordon_node(
 ) -> ApiResponse[NodeActionData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.uncordon(cluster=cluster, node_name=node, kube=kube)
+    data = await asyncio.to_thread(
+        svc.uncordon, cluster=cluster, node_name=node, kube=kube,
+    )
     return ApiResponse(data=data, request_id=_request_id(request))
 
 
@@ -278,7 +284,9 @@ async def drain_node(
     # resolved inside the service — the client cannot set a per-request timeout.
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.drain(cluster=cluster, node_name=node, kube=kube, options=body.options)
+    data = await asyncio.to_thread(
+        svc.drain, cluster=cluster, node_name=node, kube=kube, options=body.options,
+    )
     return ApiResponse(data=data, request_id=_request_id(request))
 
 
@@ -304,7 +312,8 @@ async def patch_node_labels(
 ) -> ApiResponse[NodeMetadataData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.label_node(
+    data = await asyncio.to_thread(
+        svc.label_node,
         cluster=cluster,
         node_name=node,
         kube=kube,
@@ -336,7 +345,8 @@ async def patch_node_annotations(
 ) -> ApiResponse[NodeMetadataData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.annotate_node(
+    data = await asyncio.to_thread(
+        svc.annotate_node,
         cluster=cluster,
         node_name=node,
         kube=kube,
@@ -370,7 +380,8 @@ async def patch_node_taints(
 ) -> ApiResponse[NodeTaintData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
-    data = svc.taint_node(
+    data = await asyncio.to_thread(
+        svc.taint_node,
         cluster=cluster,
         node_name=node,
         kube=kube,

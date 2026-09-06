@@ -101,7 +101,9 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 - **Always HTTP 200** when the cluster itself was reachable, even if every node failed. The status code describes the request; per-node outcomes live in `results`, with a `summary` so callers can branch on one field. 207 Multi-Status was rejected — proxies and clients handle it inconsistently.
 - Success and failure entries share **one** model (`BatchNodeResult`); success leaves the error fields unset. Don't split them into a union — it generates an awkward `anyOf` in OpenAPI-derived clients.
 - Batch size is capped at 100 by the Pydantic request model, so the bound is visible in the OpenAPI schema and an oversized batch is a 422 before any work starts.
-- These two routes run the service call through **`asyncio.to_thread`**. `NodeService` is synchronous (blocking `kubernetes` client), so calling it inline from an `async def` route blocks the event loop for the whole batch — N round-trips during which the process serves nothing, health checks included. **The seven single-node routes still have this defect**; fix them separately rather than copying the inline pattern into new batch work.
+- Like every other node route, these run the service call through **`asyncio.to_thread`** — see below.
+
+**Never call a Kubernetes service inline from a route.** `NodeService` is synchronous — the `kubernetes` SDK blocks on urllib3 sockets — so calling it directly from an `async def` handler holds the single event-loop thread for the whole operation, and the process answers nothing meanwhile, health checks included. Every node route therefore wraps its service call in `await asyncio.to_thread(svc.method, ...)`. This matters most for `drain`, whose wait budget is 25s (`DRAIN_DEFAULT_TIMEOUT_SECONDS`) and whose poll loop sleeps between attempts: inline, one drain could freeze the pod long enough for a liveness probe to restart it. Note the worker pool is bounded (FastAPI defaults to 40 threads), so this converts "everything freezes" into "long operations queue past 40 concurrent" — better, but not unbounded.
 
 **App factory** (`app/main.py`): `create_app()` returns the FastAPI instance; the module-level `app = create_app()` line is what uvicorn targets. Swagger UI / ReDoc routes are only registered when `DEBUG=true` and serve from `app/static/docs-assets/` for offline use.
 
@@ -112,7 +114,8 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 3. For Kubernetes endpoints: depend on `_get_cluster_repo` → `repo.get_kube_client_config(cluster)` → `KubeClientFactory().get_core_v1(cfg)`, then pass the `CoreV1Api` into the service. **Do not import the `kubernetes` SDK from a router.**
 4. Mount the router in `app/api/router.py`.
 5. Add the scope to the relevant entries in `data/users.json`.
-6. If the endpoint acts on many resources at once, follow the **Batch endpoints** conventions above — colon-suffix route, always-200 partial-success envelope, a size cap on the request model, and `asyncio.to_thread` around the synchronous service call.
+6. Wrap the service call in `await asyncio.to_thread(...)` — see **Never call a Kubernetes service inline from a route** above.
+7. If the endpoint acts on many resources at once, follow the **Batch endpoints** conventions above — colon-suffix route, always-200 partial-success envelope, and a size cap on the request model.
 
 ## Environment Files
 
