@@ -76,7 +76,9 @@ The `/token` OAuth2 endpoint is registered directly on the root app (not on a ve
 Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) which `KubeClientFactory` consumes. The factory builds a **fresh** `ApiClient` + `Configuration` per call to prevent cross-cluster state pollution under concurrency — do not cache or reuse `CoreV1Api` across requests.
 
 **Node operations** (`app/services/node_service.py`):
-- `cordon` patches `spec.unschedulable=true` **and** stamps two labels (`cordon_reason`, `cordon_by`) whose *values* come from `Settings.CORDON_LABEL_REASON` / `CORDON_LABEL_BY`. `uncordon` removes them.
+- `cordon` / `uncordon` patch `spec.unschedulable` and nothing else. Both delegate to the shared `_patch_unschedulable` helper — keep new schedulability operations on that path rather than issuing their own patch.
+- `cordon_many` / `uncordon_many` are the batch equivalents, both thin wrappers over `_batch_set_unschedulable`. The batch loop is **sequential** (Kubernetes has no transaction across N node patches, and a single patch is cheap) and de-duplicates node names so `results` is safe to key by name.
+- **Failure layering is the load-bearing rule for batches.** A per-node failure is collected into `results` and never aborts the batch; a *cluster*-level failure propagates as an exception so the caller sees one error instead of N identical ones. `_is_cluster_level` decides which is which: connection errors (tagged `cluster_level` by `_connection_error`) and 401/403 from the API server. When adding a new failure mode, decide which side it belongs on — getting this wrong reports "your credentials are dead" as "these 8 nodes are broken".
 - `drain` always skips DaemonSet pods, mirror/static pods, and completed/failed pods (not user-configurable). Eviction honours PDBs by default; pass `disable_eviction=true` in `DrainOptions` to bypass with a raw delete. `dry_run` is resolved at the router layer and never reaches the service.
 - `label_node` / `annotate_node` accept a `set` map and a `remove` list, then re-read the node and return the full current label/annotation state in the response.
 
@@ -94,6 +96,15 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 
 **Response envelope**: Success → `ApiResponse[T]` → `{"data": <T>, "request_id": "..."}`. Errors → `{"error": {"code", "message", "detail?"}, "request_id"}`. The `request_id` is propagated from the `X-Coordination-ID` header via `RequestIdMiddleware` and echoed in the response header.
 
+**Batch endpoints** (`POST …/nodes:cordon`, `POST …/nodes:uncordon`):
+- **Route convention**: collection-level actions use a **colon suffix** (`nodes:cordon`), not a path segment. `nodes/cordon` would read as "the node named cordon"; the colon marks a custom action on the collection. Single-resource actions keep the existing `nodes/{node}/cordon` form. Follow this for any new batch action.
+- **Always HTTP 200** when the cluster itself was reachable, even if every node failed. The status code describes the request; per-node outcomes live in `results`, with a `summary` so callers can branch on one field. 207 Multi-Status was rejected — proxies and clients handle it inconsistently.
+- Success and failure entries share **one** model (`BatchNodeResult`); success leaves the error fields unset. Don't split them into a union — it generates an awkward `anyOf` in OpenAPI-derived clients.
+- Batch size is capped at 100 by the Pydantic request model, so the bound is visible in the OpenAPI schema and an oversized batch is a 422 before any work starts.
+- Like every other node route, these run the service call through **`asyncio.to_thread`** — see below.
+
+**Never call a Kubernetes service inline from a route.** `NodeService` is synchronous — the `kubernetes` SDK blocks on urllib3 sockets — so calling it directly from an `async def` handler holds the single event-loop thread for the whole operation, and the process answers nothing meanwhile, health checks included. Every node route therefore wraps its service call in `await asyncio.to_thread(svc.method, ...)`. This matters most for `drain`, whose wait budget is 25s (`DRAIN_DEFAULT_TIMEOUT_SECONDS`) and whose poll loop sleeps between attempts: inline, one drain could freeze the pod long enough for a liveness probe to restart it. Note the worker pool is bounded (FastAPI defaults to 40 threads), so this converts "everything freezes" into "long operations queue past 40 concurrent" — better, but not unbounded.
+
 **App factory** (`app/main.py`): `create_app()` returns the FastAPI instance; the module-level `app = create_app()` line is what uvicorn targets. Swagger UI / ReDoc routes are only registered when `DEBUG=true` and serve from `app/static/docs-assets/` for offline use.
 
 ### Adding a new protected endpoint
@@ -103,6 +114,8 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 3. For Kubernetes endpoints: depend on `_get_cluster_repo` → `repo.get_kube_client_config(cluster)` → `KubeClientFactory().get_core_v1(cfg)`, then pass the `CoreV1Api` into the service. **Do not import the `kubernetes` SDK from a router.**
 4. Mount the router in `app/api/router.py`.
 5. Add the scope to the relevant entries in `data/users.json`.
+6. Wrap the service call in `await asyncio.to_thread(...)` — see **Never call a Kubernetes service inline from a route** above.
+7. If the endpoint acts on many resources at once, follow the **Batch endpoints** conventions above — colon-suffix route, always-200 partial-success envelope, and a size cap on the request model.
 
 ## Environment Files
 
@@ -126,3 +139,17 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 - `rest_client/` — `.http` files (`auth.http`, `cluster.http`, `deploy.http`) for manual API exploration in JetBrains / VS Code REST Client.
 - `data/users.json` — accounts, bcrypt hashes, scopes. Use `make hash p=<password>` or `POST /api/v1/auth/hash-password` to generate hashes.
 - `data/kubeconfigs/` — default `KUBECONFIG_BASE_PATH`; drop `<cluster>.yaml` or `<cluster>.json` files here for the cluster repositories to discover.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues in `ShannonHung/Cluster-Service`, managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

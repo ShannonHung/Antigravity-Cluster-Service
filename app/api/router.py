@@ -18,6 +18,8 @@ Route layout:
   POST /api/v1/clusters/{cluster}/nodes/{node}/cordon          → Cordon a node
   POST /api/v1/clusters/{cluster}/nodes/{node}/uncordon        → Uncordon a node
   POST /api/v1/clusters/{cluster}/nodes/{node}/drain           → Drain a node
+  POST /api/v1/clusters/{cluster}/nodes:cordon                 → Cordon several nodes (batch)
+  POST /api/v1/clusters/{cluster}/nodes:uncordon               → Uncordon several nodes (batch)
   GET  /api/v1/clusters/{cluster}/pods                         → List pods in a namespace (filtered)
   PATCH /api/v1/clusters/{cluster}/nodes/{node}/taints         → Set or remove node taints
   GET  /api/v1/inventory/nodes/{node_name}                    → Cluster node lookup (proxy)

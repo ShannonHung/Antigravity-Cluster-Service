@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -271,3 +271,73 @@ class ClusterListData(BaseModel):
     """Response body for GET /clusters."""
 
     clusters: list[ClusterInfo]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Batch node actions (cordon / uncordon)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BatchNodeRequest(BaseModel):
+    """HTTP request body for POST …/nodes:cordon and …/nodes:uncordon."""
+
+    nodes: list[str] = Field(
+        min_length=1,
+        max_length=100,
+        description="Node names to act on. Duplicates are de-duplicated, preserving first-seen order.",
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="Human-readable reason for the batch (logged, not sent to K8s).",
+    )
+
+    @field_validator("nodes")
+    @classmethod
+    def _strip_node_names(cls, names: list[str]) -> list[str]:
+        """Trim surrounding whitespace and drop blanks.
+
+        Kubernetes node names are DNS subdomain names and never contain
+        whitespace, so a padded name is a typo. Left as-is it would survive
+        de-duplication as a distinct node and come back as its own failure,
+        making one mistyped name look like two broken machines.
+        """
+        stripped = [n.strip() for n in names]
+        return [n for n in stripped if n]
+
+
+class BatchNodeResult(BaseModel):
+    """Outcome for a single node in a batch.
+
+    One shape for both outcomes: success entries leave the three error fields
+    unset. A success/failure union was rejected — it generates an awkward
+    ``anyOf`` in OpenAPI-derived clients.
+    """
+
+    node: str
+    status: Literal["success", "failed"]
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    kube_status: Optional[int] = Field(
+        default=None,
+        description="Underlying Kubernetes HTTP status — lets callers tell a retryable 503 from a 403.",
+    )
+
+
+class BatchSummary(BaseModel):
+    """Aggregate counts for a batch, so callers can branch on one field."""
+
+    total: int
+    succeeded: int
+    failed: int
+
+
+class BatchNodeActionData(BaseModel):
+    """Response body for the batch cordon / uncordon endpoints.
+
+    ``cluster`` and ``action`` are constant across the batch and hoisted here
+    rather than repeated in every result entry.
+    """
+
+    cluster: str
+    action: str  # "cordon" | "uncordon"
+    summary: BatchSummary
+    results: list[BatchNodeResult] = Field(default_factory=list)

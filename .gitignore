@@ -34,3 +34,6 @@ coverage.xml
 
 # personal data
 data/kubeconfigs/k3d-mycluster.yaml
+
+
+.DS_Store
