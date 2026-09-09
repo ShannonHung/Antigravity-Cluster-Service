@@ -311,8 +311,14 @@ class NodeService:
         rather than on a guess.
         """
         results: list[BatchNodeResult] = []
+        # Only uncordon gates on readiness, and only when there is work to do:
+        # `_strip_node_names` drops blank entries after min_length validation,
+        # so an all-blank body arrives here empty and must not buy a listing
+        # for a loop that will not run.
         statuses = (
-            self._node_statuses(cluster, kube) if not unschedulable else {}
+            self._node_statuses(cluster, kube)
+            if not unschedulable and node_names
+            else {}
         )
 
         for node_name in dict.fromkeys(node_names):
@@ -889,14 +895,32 @@ class NodeService:
     def _node_status(node: V1Node) -> str:
         """Derive a node's readiness: "Ready", "NotReady" or "Unknown".
 
-        "Unknown" means the Ready condition is absent — the node controller has
-        lost contact with the kubelet. It is a *worse* signal than NotReady, not
-        a milder one, so callers gating on health must treat only "Ready" as
-        passing rather than listing the bad values.
+        The three map onto the Ready condition's ``status`` field, which is a
+        *three-valued* string, not a boolean:
+
+        - ``"True"``    → Ready.
+        - ``"False"``   → NotReady: the kubelet is reporting and says it is
+          unhealthy.
+        - ``"Unknown"`` → the node controller has stopped hearing from the
+          kubelet altogether (~40s of silence). The condition stays present and
+          its status becomes the literal string "Unknown" — the controller does
+          not remove it — so this must be read off ``cond.status`` rather than
+          inferred from a missing condition.
+
+        "Unknown" is a *worse* signal than NotReady, not a milder one: nothing
+        is reporting at all. Callers gating on health must therefore treat only
+        "Ready" as passing rather than listing the bad values, since any future
+        status string would otherwise be admitted by default.
+
+        A node with no conditions at all has only just registered and has not
+        yet been assessed; it is reported "Unknown" for the same reason — its
+        health is unestablished.
         """
         for cond in (node.status.conditions or []):
             if cond.type == "Ready":
-                return "Ready" if cond.status == "True" else "NotReady"
+                if cond.status == "True":
+                    return "Ready"
+                return "Unknown" if cond.status == "Unknown" else "NotReady"
         return "Unknown"
 
     @staticmethod

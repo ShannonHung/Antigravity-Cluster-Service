@@ -195,7 +195,11 @@ async def cordon_nodes(
         "the batch cordon endpoint.\n\n"
         "Each node must be Ready; one that is not fails on its own with "
         "`NODE_NOT_READY` and never aborts the batch — including when every "
-        "node in the batch fails that way."
+        "node in the batch fails that way.\n\n"
+        "Readiness for the whole batch comes from a single `list nodes` call, "
+        "so the credentials for this cluster need **list** on nodes in addition "
+        "to **patch**. A token holding only patch fails the batch outright "
+        "rather than returning per-node results."
     ),
 )
 async def uncordon_nodes(

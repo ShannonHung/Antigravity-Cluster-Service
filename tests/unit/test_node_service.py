@@ -45,6 +45,7 @@ def _make_node(
     labels: dict[str, str] | None = None,
     annotations: dict[str, str] | None = None,
     taints: list | None = None,
+    ready_status: str | None = None,
 ) -> MagicMock:
     node = MagicMock()
     node.metadata.name = name
@@ -57,7 +58,10 @@ def _make_node(
     node.spec.taints = taints if taints is not None else []
     cond = MagicMock()
     cond.type = "Ready"
-    cond.status = "True" if ready else "False"
+    # Kubernetes' Ready condition is three-valued: "True", "False", or the
+    # literal "Unknown" when the node controller has lost contact with the
+    # kubelet. ready_status overrides the boolean to reach that third state.
+    cond.status = ready_status if ready_status is not None else ("True" if ready else "False")
     node.status.conditions = [cond]
     node.status.node_info = MagicMock()
     node.status.node_info.kubelet_version = kubelet_version
@@ -238,9 +242,27 @@ def test_uncordon_refuses_not_ready_node():
     kube.patch_node.assert_not_called()
 
 
-def test_uncordon_refuses_node_with_unknown_status():
-    """An absent Ready condition means the kubelet is out of contact — a worse
-    signal than NotReady, so it must not slip through a NotReady-only check."""
+def test_uncordon_refuses_node_whose_kubelet_is_out_of_contact():
+    """A silent kubelet is reported by Kubernetes as Ready=Unknown — the
+    condition stays present and its status becomes the string "Unknown".
+
+    This is the real-world lost-contact state, and it must be reported as
+    Unknown rather than collapsed into NotReady: they have different causes
+    and different fixes.
+    """
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node("worker-1", ready_status="Unknown")
+
+    with pytest.raises(NodeNotReadyException) as exc_info:
+        _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
+
+    assert exc_info.value.detail["status"] == "Unknown"
+    kube.patch_node.assert_not_called()
+
+
+def test_uncordon_refuses_node_with_no_conditions_yet():
+    """A node that has only just registered has no conditions; its health is
+    unestablished, so it is Unknown rather than assumed healthy."""
     kube = _make_kube()
     node = _make_node("worker-1")
     node.status.conditions = []
@@ -251,6 +273,30 @@ def test_uncordon_refuses_node_with_unknown_status():
 
     assert exc_info.value.detail["status"] == "Unknown"
     kube.patch_node.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cond_status, expected",
+    [("True", "Ready"), ("False", "NotReady"), ("Unknown", "Unknown")],
+)
+def test_node_status_maps_all_three_condition_values(cond_status, expected):
+    """The Ready condition is three-valued; NotReady and Unknown must not be
+    conflated, since only one of them means "nothing is reporting at all"."""
+    node = _make_node("worker-1", ready_status=cond_status)
+    assert NodeService._node_status(node) == expected
+
+
+def test_list_nodes_reports_unknown_for_silent_kubelet():
+    """The same distinction must survive into the list response, not just the
+    uncordon gate — an operator reads it there first."""
+    kube = _make_kube()
+    kube.list_node.return_value = MagicMock(
+        items=[_make_node("worker-1", ready_status="Unknown")]
+    )
+
+    result = _svc().list_nodes(cluster="test", kube=kube)
+
+    assert result.nodes[0].status == "Unknown"
 
 
 def test_cordon_is_not_gated_on_readiness():
@@ -1134,6 +1180,17 @@ def test_uncordon_many_node_absent_from_listing_yields_404_not_409():
 
     assert result.summary.failed == 1
     assert result.results[0].error_code == "NODE_NOT_FOUND"
+
+
+def test_uncordon_many_with_no_nodes_skips_the_listing():
+    """An all-blank body survives min_length validation and arrives empty; it
+    must not pay for a cluster listing to iterate zero nodes."""
+    kube = _make_kube()
+
+    result = _svc().uncordon_many(cluster="test", node_names=[], kube=kube)
+
+    assert result.summary.total == 0
+    kube.list_node.assert_not_called()
 
 
 def test_cordon_many_does_not_check_readiness():

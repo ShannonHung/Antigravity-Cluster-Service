@@ -296,6 +296,13 @@ class NodeNotReadyException(BaseAppException):
     A node that flaps therefore still gets filled during any Ready window, and
     this check — evaluated once, at request time — cannot see that coming. It
     catches operator error, not instability.
+
+    The check is also not atomic with the patch that follows it: a node can go
+    NotReady in between, and in a batch the readiness snapshot is taken once up
+    front, so the last node of a large batch is judged on a reading several
+    round-trips old. Kubernetes offers no compare-and-set on this path, and the
+    failure mode is benign — an uncordoned node that has just gone NotReady
+    takes no pods until it recovers.
     """
 
     http_status = 409
