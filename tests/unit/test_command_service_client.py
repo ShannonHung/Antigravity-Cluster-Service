@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 from app.clients.command_service_client import CommandServiceClient
 from app.core.exceptions import DeployServiceError
-from app.domain.command_models import CommandExecutionRequest
+from app.domain.command_models import CommandExecutionRequest, OutputFormat
 
 
 def _client_with_responses(*responses: httpx.Response) -> CommandServiceClient:
@@ -61,6 +61,51 @@ async def test_non_2xx_raises_deploy_service_error():
     )
     with pytest.raises(DeployServiceError):
         await c.get_command_result("missing")
+
+
+async def test_get_command_result_defaults_to_raw_format():
+    captured: dict = {}
+    tm = AsyncMock()
+    tm.get_token = AsyncMock(return_value="tok")
+    c = CommandServiceClient(base_url="http://deploy", token_manager=tm)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        return httpx.Response(200, json={"data": {"command_id": "abc", "status": "success"}, "request_id": "x"})
+
+    c._transport = httpx.MockTransport(handler)
+    await c.get_command_result("abc")
+    assert captured["url"].params.get("format") == "raw"
+
+
+async def test_get_command_result_forwards_json_format_and_unwraps():
+    captured: dict = {}
+    tm = AsyncMock()
+    tm.get_token = AsyncMock(return_value="tok")
+    c = CommandServiceClient(base_url="http://deploy", token_manager=tm)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = request.url
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "command_id": "abc",
+                    "status": "success",
+                    "output": '{"ok": true}',
+                    "output_json": {"ok": True},
+                    "output_json_error": None,
+                },
+                "request_id": "x",
+            },
+        )
+
+    c._transport = httpx.MockTransport(handler)
+    resp = await c.get_command_result("abc", OutputFormat.JSON)
+    assert captured["url"].params.get("format") == "json"
+    assert resp.output_json == {"ok": True}
+    assert resp.output == '{"ok": true}'
+    assert resp.output_json_error is None
 
 
 async def test_401_triggers_refresh_and_retry():
