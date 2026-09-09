@@ -25,6 +25,12 @@ Content-Type: application/json
 GET {{baseUrl}}/api/v1/command/execution/{{command_id}}
 Authorization: Bearer {{token}}
 
+### Poll result and parse stdout as JSON (output_json)
+# Only for commands whose whitelist entry declares output_format: "json";
+# otherwise deploy-service returns 400. `output` still keeps its raw string.
+GET {{baseUrl}}/api/v1/command/execution/{{command_id}}?format=json
+Authorization: Bearer {{token}}
+
 ### View live logs (open in browser)
 GET {{baseUrl}}/api/v1/command/execution/{{command_id}}/view
 

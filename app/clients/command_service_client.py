@@ -19,6 +19,7 @@ from app.domain.command_models import (
     CommandExecutionResponse,
     CommandTraceResponse,
     CommandWhitelistConfig,
+    OutputFormat,
     UserCommandWhitelist,
 )
 
@@ -108,10 +109,16 @@ class CommandServiceClient:
         )
         return CommandExecutionResponse(**raw["data"])
 
-    async def get_command_result(self, command_id: str) -> CommandExecutionResponse:
+    async def get_command_result(
+        self, command_id: str, output_format: OutputFormat = OutputFormat.RAW
+    ) -> CommandExecutionResponse:
+        # Forward the ?format= query param. deploy-service parses stdout into
+        # output_json only when json is requested AND the command declares
+        # output_format: "json"; format=raw is the unchanged historical response.
         raw = await self._request_with_retry(
             "GET", f"/api/v1/command/execution/{command_id}",
             context="get_command_result",
+            params={"format": output_format.value},
         )
         return CommandExecutionResponse(**raw["data"])
 
