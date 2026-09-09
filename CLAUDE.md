@@ -80,6 +80,8 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 - `cordon_many` / `uncordon_many` are the batch equivalents, both thin wrappers over `_batch_set_unschedulable`. The batch loop is **sequential** (Kubernetes has no transaction across N node patches, and a single patch is cheap) and de-duplicates node names so `results` is safe to key by name.
 - **Failure layering is the load-bearing rule for batches.** A per-node failure is collected into `results` and never aborts the batch; a *cluster*-level failure propagates as an exception so the caller sees one error instead of N identical ones. `_is_cluster_level` decides which is which: connection errors (tagged `cluster_level` by `_connection_error`) and 401/403 from the API server. When adding a new failure mode, decide which side it belongs on — getting this wrong reports "your credentials are dead" as "these 8 nodes are broken".
 - `drain` always skips DaemonSet pods, mirror/static pods, and completed/failed pods (not user-configurable). Eviction honours PDBs by default; pass `disable_eviction=true` in `DrainOptions` to bypass with a raw delete. `dry_run` is resolved at the router layer and never reaches the service.
+- **Drain refuses before it evicts.** Unmanaged pods (no `ownerReferences`) and emptyDir pods are *protected*: without `force` / `delete_emptydir_data` the whole drain returns 400 `DRAIN_BLOCKED` naming every blocked pod and every option needed, having touched nothing. Partial drains are not a thing — evicted pods cannot be recalled, so a half-drained node is worse than an untouched one. The always-skipped categories are checked first, so a DaemonSet pod using emptyDir is skipped, never blocked.
+- **Outliving the drain wait budget is not an error.** `DRAIN_DEFAULT_TIMEOUT_SECONDS` bounds how long drain *watches*, not what it asks for. When it expires, drain returns 200 with `still_terminating`, `node_emptied` and `forced_deletion` — every eviction was accepted, and a pod with a long `terminationGracePeriodSeconds` is behaving as configured. There is no `DrainTimeoutException`; see `docs/adr/0001-*`.
 - `label_node` / `annotate_node` accept a `set` map and a `remove` list, then re-read the node and return the full current label/annotation state in the response.
 
 **Deploy-service client** (`app/clients/deploy_service_client.py` + `app/core/token_manager.py`):
@@ -132,6 +134,7 @@ Both produce a unified `KubeClientConfig` (`app/domain/kubernetes_models.py`) wh
 - `tests/fixtures/users.json` is the user file loaded in test mode.
 - Unit tests mock repository / client dependencies directly; integration tests use the full `TestClient`.
 - `asyncio_mode = "auto"` is set in `pyproject.toml` — no `@pytest.mark.asyncio` needed.
+- Tests marked `e2e` need a live cluster and are **excluded from `make test`**; run them with `make test-e2e`. They cordon and empty a real node (`E2E_DRAIN_NODE`, default `k3d-mycluster-agent-1`), so never point them at a node running anything irreplaceable. They skip rather than fail when no cluster is reachable. See `docs/drain-e2e-testing.md`.
 - The `kubernetes` SDK is **not** mocked at the SDK level — tests inject a fake `CoreV1Api`-shaped object into `NodeService`. Follow that pattern rather than patching `kubernetes.client`.
 
 ## Other directories
