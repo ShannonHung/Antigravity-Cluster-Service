@@ -70,6 +70,7 @@ class ErrorCode(StrEnum):
     NODE_OPERATION_FAILED      = "NODE_OPERATION_FAILED"
     KUBE_API_ERROR             = "KUBE_API_ERROR"
     DRAIN_TIMEOUT              = "DRAIN_TIMEOUT"
+    NODE_NOT_READY             = "NODE_NOT_READY"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -276,6 +277,38 @@ class NodeNotFoundException(BaseAppException):
     http_status = 404
     error_code = ErrorCode.NODE_NOT_FOUND
     log_level = logging.INFO
+
+
+class NodeNotReadyException(BaseAppException):
+    """Raised when uncordon is asked for a node that is not Ready.
+
+    Uncordoning is a promise that the node is fit to take work. Making that
+    promise about a node the cluster currently considers unhealthy is almost
+    always a mistake — usually someone acting on a stale view of the cluster.
+
+    409, not 400: the request is well-formed and there is no parameter that
+    would make it succeed. What has to change is the node, not the call. A 400
+    would send the caller looking for a mistake in their own request.
+
+    Note what this does **not** protect against. ``spec.unschedulable`` and the
+    Ready condition are independent: an uncordoned NotReady node takes no pods
+    *while* it is NotReady, and the scheduler fills it the moment it goes Ready.
+    A node that flaps therefore still gets filled during any Ready window, and
+    this check — evaluated once, at request time — cannot see that coming. It
+    catches operator error, not instability.
+    """
+
+    http_status = 409
+    error_code = ErrorCode.NODE_NOT_READY
+    log_level = logging.WARNING
+
+    def __init__(self, node_name: str, status: str) -> None:
+        super().__init__(
+            f"Node '{node_name}' is {status}, so it cannot be uncordoned. "
+            f"Uncordoning declares the node fit to receive pods; wait for it "
+            f"to report Ready, or investigate why it is not.",
+            detail={"node": node_name, "status": status},
+        )
 
 
 class KubeApiException(BaseAppException):

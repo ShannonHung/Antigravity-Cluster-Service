@@ -123,7 +123,16 @@ async def cordon_node(
     "/{cluster}/nodes/{node}/uncordon",
     response_model=ApiResponse[NodeActionData],
     summary="Uncordon a node",
-    description="Re-enables scheduling on the node.",
+    description=(
+        "Re-enables scheduling on the node.\n\n"
+        "The node must currently be **Ready**. Uncordoning declares a node fit "
+        "to receive pods, so this is refused with 409 `NODE_NOT_READY` for a "
+        "NotReady or Unknown node — there is no override, because no change to "
+        "the request can make an unhealthy node healthy.\n\n"
+        "Note this guards against acting on a stale view of the cluster, not "
+        "against instability: an uncordoned node that flaps in and out of Ready "
+        "will still be filled during its Ready windows."
+    ),
 )
 async def uncordon_node(
     request: Request,
@@ -183,7 +192,10 @@ async def cordon_nodes(
     summary="Uncordon several nodes",
     description=(
         "Re-enables scheduling on each listed node. Response semantics match "
-        "the batch cordon endpoint."
+        "the batch cordon endpoint.\n\n"
+        "Each node must be Ready; one that is not fails on its own with "
+        "`NODE_NOT_READY` and never aborts the batch — including when every "
+        "node in the batch fails that way."
     ),
 )
 async def uncordon_nodes(
