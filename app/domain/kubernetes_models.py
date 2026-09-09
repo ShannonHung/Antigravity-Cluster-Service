@@ -72,8 +72,11 @@ class DrainOptions(BaseModel):
     )
     grace_period_seconds: Optional[int] = Field(
         default=None,
+        ge=0,
         description="Override pod termination grace period (--grace-period). "
-                    "None means use each pod's own setting.",
+                    "None means use each pod's own setting. 0 deletes pods "
+                    "immediately without waiting for graceful shutdown — the "
+                    "response flags this as a forced deletion.",
     )
     # Note: there is no client-settable drain timeout. The wait budget is owned
     # by the server (DRAIN_DEFAULT_TIMEOUT_SECONDS) and deliberately kept below
@@ -131,8 +134,20 @@ class DrainedPodInfo(BaseModel):
     namespace: str
 
 
+class StillTerminatingPodInfo(BaseModel):
+    """A pod whose eviction was accepted but which had not gone by the deadline.
+
+    Not an error: a pod with a long ``terminationGracePeriodSeconds`` is
+    shutting down exactly as configured. It is reported so the caller knows
+    the node is not yet empty without having to diff two pod listings.
+    """
+
+    name: str
+    namespace: str
+
+
 class DrainActionData(BaseModel):
-    """Response body for drain — superset of NodeActionData with pod list."""
+    """Response body for drain — superset of NodeActionData with pod lists."""
 
     status: str = "success"
     cluster: str
@@ -141,7 +156,29 @@ class DrainActionData(BaseModel):
     dry_run: bool = False
     drained_pods: list[DrainedPodInfo] = Field(
         default_factory=list,
-        description="Pods that were evicted or deleted during this drain operation.",
+        description="Pods whose eviction or deletion this drain requested.",
+    )
+    still_terminating: list[StillTerminatingPodInfo] = Field(
+        default_factory=list,
+        description=(
+            "Pods still present when the wait budget expired. Empty means the "
+            "node is drained. Non-empty is a normal outcome, not a failure — "
+            "the drain is idempotent and may be re-run to keep waiting."
+        ),
+    )
+    node_emptied: bool = Field(
+        default=True,
+        description=(
+            "True when every targeted pod is gone. Lets a caller branch on one "
+            "field instead of testing a list's length."
+        ),
+    )
+    forced_deletion: bool = Field(
+        default=False,
+        description=(
+            "True when grace_period_seconds=0 was used — pods were killed "
+            "immediately with no graceful shutdown."
+        ),
     )
 
 

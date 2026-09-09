@@ -309,7 +309,7 @@ async def patch_node_labels(
     current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))] = None,
     repo: ClusterRepository = Depends(_get_cluster_repo),
     svc: NodeService = Depends(_get_node_service),
-) -> ApiResponse[NodeMetadataData]:
+) -> ApiResponse[NodeLabelsData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = await asyncio.to_thread(
@@ -342,7 +342,7 @@ async def patch_node_annotations(
     current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))] = None,
     repo: ClusterRepository = Depends(_get_cluster_repo),
     svc: NodeService = Depends(_get_node_service),
-) -> ApiResponse[NodeMetadataData]:
+) -> ApiResponse[NodeAnnotationsData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = await asyncio.to_thread(

@@ -18,7 +18,8 @@ help:
 	@echo "  make dev          啟動開發伺服器（使用 .env + .env.dev，熱重載）"
 	@echo "  make prod         啟動生產伺服器（使用 .env + .env.prod）"
 	@echo ""
-	@echo "  make test         執行全部測試"
+	@echo "  make test         執行全部測試 (不含 e2e)"
+	@echo "  make test-e2e     執行 e2e 測試 (需要 k8s 叢集)"
 	@echo "  make test-unit    只執行 unit tests"
 	@echo "  make test-int     只執行 integration tests"
 	@echo "  make test-cov     執行全部測試並顯示覆蓋率"
@@ -51,7 +52,11 @@ prod:
 # ─── Test ────────────────────────────────────────────────────────────────────
 .PHONY: test
 test:
-	APP_ENV=test $(PYTEST) tests/ -v
+	APP_ENV=test $(PYTEST) tests/ -v -m 'not e2e'
+
+.PHONY: test-e2e
+test-e2e:
+	APP_ENV=test $(PYTEST) tests/e2e/ -v -m e2e
 
 .PHONY: test-unit
 test-unit:

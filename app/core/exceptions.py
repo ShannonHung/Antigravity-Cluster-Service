@@ -69,7 +69,7 @@ class ErrorCode(StrEnum):
     NODE_NOT_FOUND             = "NODE_NOT_FOUND"
     NODE_OPERATION_FAILED      = "NODE_OPERATION_FAILED"
     KUBE_API_ERROR             = "KUBE_API_ERROR"
-    DRAIN_TIMEOUT              = "DRAIN_TIMEOUT"
+    DRAIN_BLOCKED              = "DRAIN_BLOCKED"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,79 +300,63 @@ class KubeApiException(BaseAppException):
         super().__init__(message, **kwargs)
 
 
-class DrainTimeoutException(BaseAppException):
-    """Raised when a node drain does not finish within its timeout budget.
+class DrainBlockedException(BaseAppException):
+    """Raised when a drain would touch pods that its options do not permit.
 
-    The app deliberately times out *before* any front proxy would, so the caller
-    receives this structured 504 (naming the pods still running and hinting that
-    drain can be safely retried) instead of a bare gateway 500.
+    Mirrors ``kubectl drain``'s refusal semantics: a pod with no controller, or
+    one using an emptyDir volume, is protected unless the caller explicitly
+    opts out. The check runs **before any pod is evicted**, so a rejected drain
+    changes nothing on the cluster and the caller learns every blocker in one
+    round-trip rather than discovering them one eviction at a time.
 
-    Drain is idempotent: the node stays cordoned, so re-invoking drain simply
-    continues evicting whatever is left. When pods refuse to leave under a plain
-    drain, ``detail.suggested_options`` recommends the stronger flags the caller
-    has not enabled yet (force / disable_eviction / grace 0 / delete emptyDir).
+    The node is left cordoned — cordoning is what a drain is for, is harmless
+    on its own, and re-running with the right flags then has nothing to redo.
     """
 
-    http_status = 504
-    error_code = ErrorCode.DRAIN_TIMEOUT
+    http_status = 400
+    error_code = ErrorCode.DRAIN_BLOCKED
     log_level = logging.WARNING
 
-    def __init__(
-        self,
-        node_name: str,
-        timeout_seconds: int,
-        still_running: list[tuple[str, str]],
-        current_options: Any = None,
-    ) -> None:
-        pods = [{"namespace": ns, "name": name} for ns, name in sorted(still_running)]
-        suggested = self._suggest_stronger_options(current_options)
+    #: Reason → the option that unblocks it. Order fixes the message ordering.
+    UNBLOCKING_OPTION = {
+        "unmanaged": "force",
+        "emptydir": "delete_emptydir_data",
+    }
+
+    def __init__(self, node_name: str, blocked: list[dict]) -> None:
+        """``blocked`` — one entry per pod: ``{namespace, name, reasons: [...]}``."""
+        required = self._required_options(blocked)
 
         message = (
-            f"Drain of node '{node_name}' exceeded {timeout_seconds}s with "
-            f"{len(pods)} pod(s) still running. The node remains cordoned; "
-            f"you may safely retry the drain to continue evicting the "
-            f"remaining pods."
+            f"Drain of node '{node_name}' is blocked by {len(blocked)} pod(s) "
+            f"that the supplied options do not permit removing. No pod was "
+            f"evicted and the node is unchanged. Retry with: "
+            + ", ".join(f"{k}={v}" for k, v in required.items())
+            + "."
         )
-        if suggested:
-            message += (
-                " If they keep hanging, retry with stronger options: "
-                + ", ".join(f"{k}={v}" for k, v in suggested.items())
-                + "."
-            )
 
         super().__init__(
             message,
             detail={
                 "node": node_name,
-                "timeout_seconds": timeout_seconds,
-                "pods_still_running": pods,
-                "suggested_options": suggested,
+                "blocked_pods": blocked,
+                "required_options": required,
             },
         )
 
-    @staticmethod
-    def _suggest_stronger_options(current_options: Any) -> dict:
-        """Recommend the escalation flags the caller has NOT enabled yet.
+    @classmethod
+    def _required_options(cls, blocked: list[dict]) -> dict:
+        """Every option needed to unblock the whole set, not just the first pod.
 
-        Given the options used on the timed-out drain, offer only the stronger
-        settings that would actually add force — so an already-forceful request
-        is not told to re-enable what it already set.
+        A caller that fixes one blocker at a time pays a round-trip per blocker,
+        which is the slow discovery this endpoint exists to avoid.
         """
-        force = bool(getattr(current_options, "force", False))
-        disable_eviction = bool(getattr(current_options, "disable_eviction", False))
-        grace = getattr(current_options, "grace_period_seconds", None)
-        delete_emptydir = bool(getattr(current_options, "delete_emptydir_data", False))
-
-        suggested: dict = {}
-        if not force:
-            suggested["force"] = True
-        if not disable_eviction:
-            suggested["disable_eviction"] = True
-        if grace != 0:
-            suggested["grace_period_seconds"] = 0
-        if not delete_emptydir:
-            suggested["delete_emptydir_data"] = True
-        return suggested
+        reasons = {r for pod in blocked for r in pod.get("reasons", [])}
+        return {
+            option: True
+            for reason, option in cls.UNBLOCKING_OPTION.items()
+            if reason in reasons
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
