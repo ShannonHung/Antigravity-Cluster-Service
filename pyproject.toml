@@ -35,3 +35,6 @@ package = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "e2e: requires a live Kubernetes cluster (excluded from `make test`)",
+]

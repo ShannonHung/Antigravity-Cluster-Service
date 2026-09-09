@@ -496,11 +496,10 @@ def test_drain_blocked_still_cordons():
     assert kube.patch_node.call_args.args[1]["spec"]["unschedulable"] is True
 
 
-@pytest.mark.parametrize("owner_kind", ["DaemonSet"])
-def test_drain_never_blocks_on_always_skipped_pods(owner_kind):
+def test_drain_never_blocks_on_always_skipped_pods():
     """Unconditional skips are evaluated before the opt-out checks, so a
     DaemonSet pod using emptyDir does not demand delete_emptydir_data."""
-    pod = _make_pod("ds-1", "kube-system", owner_kind=owner_kind, empty_dir=True)
+    pod = _make_pod("ds-1", "kube-system", owner_kind="DaemonSet", empty_dir=True)
     result = _drain_with([pod], DrainOptions())
     assert result.drained_pods == []
     assert result.node_emptied is True
