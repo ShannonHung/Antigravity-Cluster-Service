@@ -14,8 +14,10 @@ import pytest
 from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
-from app.core.exceptions import DrainTimeoutException, KubeApiException, NodeNotFoundException
+from app.core.exceptions import DrainBlockedException, KubeApiException, NodeNotFoundException
 from app.domain.kubernetes_models import DrainActionData, DrainOptions, NodeActionData, NodeListData, NodeTaintData, PodListData, TaintRemoveSpec, TaintSpec
+from pydantic import ValidationError
+
 from app.services.node_service import NodeService
 
 
@@ -69,20 +71,37 @@ def _make_pod(
     name: str = "mypod",
     namespace: str = "default",
     phase: str = "Running",
-    owner_kind: str = "ReplicaSet",
+    owner_kind: str | None = "ReplicaSet",
     is_mirror: bool = False,
     node_name: str = "worker-1",
+    empty_dir: bool = False,
 ) -> MagicMock:
+    """Build a fake V1Pod.
+
+    ``owner_kind=None`` produces an unmanaged (bare) pod — the category
+    ``force`` guards. ``empty_dir=True`` attaches an emptyDir volume — the
+    category ``delete_emptydir_data`` guards.
+    """
     pod = MagicMock()
     pod.metadata.name = name
     pod.metadata.namespace = namespace
     pod.metadata.annotations = {"kubernetes.io/config.mirror": ""} if is_mirror else {}
-    owner = MagicMock()
-    owner.kind = owner_kind
-    pod.metadata.owner_references = [owner]
+    if owner_kind is None:
+        pod.metadata.owner_references = None
+    else:
+        owner = MagicMock()
+        owner.kind = owner_kind
+        pod.metadata.owner_references = [owner]
     pod.status.phase = phase
     pod.status.container_statuses = []
     pod.spec.node_name = node_name
+
+    volume = MagicMock()
+    # A non-emptyDir volume must have empty_dir set to None, not a MagicMock —
+    # every attribute of a bare MagicMock is truthy, which would make every pod
+    # look like an emptyDir user.
+    volume.empty_dir = MagicMock() if empty_dir else None
+    pod.spec.volumes = [volume]
     return pod
 
 
@@ -279,11 +298,11 @@ def test_drain_raises_on_pod_list_failure():
         _svc().drain("test", "worker-1", kube, DrainOptions())
 
 
-def _timeout_setup(monkeypatch, default: float) -> MagicMock:
+def _timeout_setup(monkeypatch, default: float, pod: MagicMock | None = None) -> MagicMock:
     """Build a kube whose target pod never disappears and freeze the clock so the
     drain deadline (settings-driven) expires on the first wait-loop check."""
     kube = _make_kube()
-    stuck = _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
+    stuck = pod if pod is not None else _make_pod("stuck-pod", "default", owner_kind="ReplicaSet")
     kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[stuck])
     monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
     times = iter([0.0, float(default) + 1.0])  # start, then past-deadline
@@ -294,70 +313,305 @@ def _timeout_setup(monkeypatch, default: float) -> MagicMock:
     return kube
 
 
-def test_drain_raises_drain_timeout_when_pods_never_terminate(monkeypatch):
-    """When a targeted pod never disappears, drain must raise a structured
-    DrainTimeoutException (504) that names the stuck pod and hints at retry —
-    not a bare KubeApiException nor a proxy-level 500. The timeout budget comes
-    from settings; the client can no longer set it."""
+# ── drain: slow termination is not an error ───────────────────────────────────
+
+def test_drain_reports_still_terminating_instead_of_raising(monkeypatch):
+    """A pod that outlives the wait budget is a normal outcome, not a failure.
+
+    Every eviction was accepted; a long terminationGracePeriodSeconds means the
+    pod is shutting down as configured. Drain returns 200 with the leftovers
+    named, so the caller sees what is still going without diffing pod listings.
+    """
     from app.core.config import get_settings
 
     get_settings.cache_clear()
     default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
     kube = _timeout_setup(monkeypatch, default)
 
-    with pytest.raises(DrainTimeoutException) as exc_info:
-        _svc().drain("test", "worker-1", kube, DrainOptions())
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
+
+    assert isinstance(result, DrainActionData)
+    assert result.node_emptied is False
+    assert [(p.namespace, p.name) for p in result.still_terminating] == [
+        ("default", "stuck-pod")
+    ]
+    # The pod was still targeted — it appears in both lists, which is the point:
+    # "we asked it to go" and "it has not gone yet" are different facts.
+    assert [p.name for p in result.drained_pods] == ["stuck-pod"]
+
+
+def test_drain_sets_node_emptied_when_all_pods_gone():
+    """The happy path flips node_emptied and leaves still_terminating empty."""
+    kube = _make_kube()
+    pod = _make_pod("web-1", "default")
+    # First call lists the pod, the wait loop then sees an empty node.
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=[pod]),
+        MagicMock(items=[]),
+    ]
+
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
+
+    assert result.node_emptied is True
+    assert result.still_terminating == []
+    assert [p.name for p in result.drained_pods] == ["web-1"]
+
+
+def test_drain_wait_returns_pods_that_vanish_exactly_at_deadline(monkeypatch):
+    """A pod gone on the final poll counts as drained, not as still-terminating.
+
+    The deadline is checked after polling, so the last observation wins — a pod
+    that terminates in the final second is not misreported as stuck.
+    """
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
+    kube = _make_kube()
+    pod = _make_pod("late-pod", "default")
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=[pod]),   # initial listing
+        MagicMock(items=[]),      # wait loop: already gone
+    ]
+    monkeypatch.setattr("app.services.node_service.time.sleep", lambda _s: None)
+    times = iter([0.0, float(default) + 1.0])
+    monkeypatch.setattr(
+        "app.services.node_service.time.monotonic", lambda: next(times, 9999.0)
+    )
+
+    result = _svc().drain("test", "worker-1", kube, DrainOptions())
+    assert result.node_emptied is True
+
+
+# ── drain: pre-flight blocking (force / delete_emptydir_data) ─────────────────
+
+def _drain_with(pods: list[MagicMock], options: DrainOptions) -> DrainActionData:
+    """Run a drain over *pods*, with the wait loop seeing an emptied node."""
+    kube = _make_kube()
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=pods),
+        MagicMock(items=[]),
+    ]
+    return _svc().drain("test", "worker-1", kube, options)
+
+
+def test_drain_blocks_unmanaged_pod_without_force():
+    """A pod with no controller has nothing to recreate it — deleting it is
+    permanent, so drain refuses until the caller says force=true."""
+    bare = _make_pod("bare-pod", "default", owner_kind=None)
+
+    with pytest.raises(DrainBlockedException) as exc_info:
+        _drain_with([bare], DrainOptions())
 
     exc = exc_info.value
-    assert exc.http_status == 504
-    # Timeout budget is the server default, not client-controlled.
-    assert exc.detail["timeout_seconds"] == default
-    # The stuck pod is reported in the structured detail.
-    assert "stuck-pod" in str(exc.detail)
-    # The message tells the user drain can be safely retried.
-    assert "retry" in exc.message.lower() or "again" in exc.message.lower()
+    assert exc.http_status == 400
+    assert exc.detail["required_options"] == {"force": True}
+    assert exc.detail["blocked_pods"] == [
+        {"namespace": "default", "name": "bare-pod", "reasons": ["unmanaged"]}
+    ]
 
 
-def test_drain_timeout_suggests_stronger_options(monkeypatch):
-    """On timeout with a plain drain, the response suggests the stronger flags
-    the caller hasn't enabled yet (force / disable_eviction / grace 0 / emptydir)."""
-    from app.core.config import get_settings
+def test_drain_evicts_unmanaged_pod_with_force():
+    bare = _make_pod("bare-pod", "default", owner_kind=None)
+    result = _drain_with([bare], DrainOptions(force=True))
+    assert [p.name for p in result.drained_pods] == ["bare-pod"]
 
-    get_settings.cache_clear()
-    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
-    kube = _timeout_setup(monkeypatch, default)
 
-    with pytest.raises(DrainTimeoutException) as exc_info:
+def test_drain_blocks_emptydir_pod_without_flag():
+    """emptyDir dies with the pod, so its data exists nowhere else."""
+    pod = _make_pod("cache-1", "default", empty_dir=True)
+
+    with pytest.raises(DrainBlockedException) as exc_info:
+        _drain_with([pod], DrainOptions())
+
+    assert exc_info.value.detail["required_options"] == {"delete_emptydir_data": True}
+
+
+def test_drain_evicts_emptydir_pod_with_flag():
+    pod = _make_pod("cache-1", "default", empty_dir=True)
+    result = _drain_with([pod], DrainOptions(delete_emptydir_data=True))
+    assert [p.name for p in result.drained_pods] == ["cache-1"]
+
+
+def test_drain_reports_both_reasons_for_doubly_blocked_pod():
+    """One pod breaking two rules must report both flags in a single response.
+
+    Reporting only the first would make the caller fix one, retry, and hit the
+    other — exactly the slow round-trip discovery this check exists to avoid.
+    """
+    pod = _make_pod("bare-cache", "default", owner_kind=None, empty_dir=True)
+
+    with pytest.raises(DrainBlockedException) as exc_info:
+        _drain_with([pod], DrainOptions())
+
+    exc = exc_info.value
+    assert exc.detail["blocked_pods"][0]["reasons"] == ["unmanaged", "emptydir"]
+    assert exc.detail["required_options"] == {
+        "force": True,
+        "delete_emptydir_data": True,
+    }
+
+
+def test_drain_aggregates_required_options_across_pods():
+    """Two pods blocked for different reasons still yield one complete answer."""
+    bare = _make_pod("bare-pod", "default", owner_kind=None)
+    cache = _make_pod("cache-1", "default", empty_dir=True)
+
+    with pytest.raises(DrainBlockedException) as exc_info:
+        _drain_with([bare, cache], DrainOptions())
+
+    assert exc_info.value.detail["required_options"] == {
+        "force": True,
+        "delete_emptydir_data": True,
+    }
+
+
+def test_drain_blocked_evicts_nothing():
+    """The refusal must happen before any eviction — a half-drained node is
+    worse than an untouched one, since killed pods cannot be recalled."""
+    kube = _make_kube()
+    bare = _make_pod("bare-pod", "default", owner_kind=None)
+    healthy = _make_pod("web-1", "default")
+    kube.list_pod_for_all_namespaces.return_value = MagicMock(items=[bare, healthy])
+
+    with pytest.raises(DrainBlockedException):
         _svc().drain("test", "worker-1", kube, DrainOptions())
 
-    suggested = exc_info.value.detail["suggested_options"]
-    # A plain drain hasn't enabled any of the escalations, so all are suggested.
-    assert suggested["force"] is True
-    assert suggested["disable_eviction"] is True
-    assert suggested["grace_period_seconds"] == 0
-    assert suggested["delete_emptydir_data"] is True
+    kube.create_namespaced_pod_eviction.assert_not_called()
+    kube.delete_namespaced_pod.assert_not_called()
 
 
-def test_drain_timeout_omits_already_enabled_options(monkeypatch):
-    """Flags the caller already set are not re-suggested — only what would add force."""
-    from app.core.config import get_settings
+def test_drain_blocked_still_cordons():
+    """Cordon precedes the check and is not rolled back: it is harmless alone,
+    and leaving it set means a corrected retry has nothing to redo."""
+    kube = _make_kube()
+    kube.list_pod_for_all_namespaces.return_value = MagicMock(
+        items=[_make_pod("bare-pod", "default", owner_kind=None)]
+    )
 
-    get_settings.cache_clear()
-    default = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
-    kube = _timeout_setup(monkeypatch, default)
+    with pytest.raises(DrainBlockedException):
+        _svc().drain("test", "worker-1", kube, DrainOptions())
 
-    with pytest.raises(DrainTimeoutException) as exc_info:
-        _svc().drain(
-            "test", "worker-1", kube,
-            DrainOptions(force=True, disable_eviction=True),
-        )
+    kube.patch_node.assert_called_once()
+    assert kube.patch_node.call_args.args[1]["spec"]["unschedulable"] is True
 
-    suggested = exc_info.value.detail["suggested_options"]
-    # force / disable_eviction already on → not repeated; the rest still offered.
-    assert "force" not in suggested
-    assert "disable_eviction" not in suggested
-    assert suggested["grace_period_seconds"] == 0
-    assert suggested["delete_emptydir_data"] is True
+
+@pytest.mark.parametrize("owner_kind", ["DaemonSet"])
+def test_drain_never_blocks_on_always_skipped_pods(owner_kind):
+    """Unconditional skips are evaluated before the opt-out checks, so a
+    DaemonSet pod using emptyDir does not demand delete_emptydir_data."""
+    pod = _make_pod("ds-1", "kube-system", owner_kind=owner_kind, empty_dir=True)
+    result = _drain_with([pod], DrainOptions())
+    assert result.drained_pods == []
+    assert result.node_emptied is True
+
+
+def test_drain_mirror_pod_with_emptydir_is_skipped_not_blocked():
+    pod = _make_pod("static-1", "kube-system", is_mirror=True, empty_dir=True)
+    result = _drain_with([pod], DrainOptions())
+    assert result.drained_pods == []
+
+
+def test_drain_completed_pod_without_owner_is_skipped_not_blocked():
+    """A Succeeded bare pod is already finished — force must not be demanded."""
+    pod = _make_pod("job-1", "default", phase="Succeeded", owner_kind=None)
+    result = _drain_with([pod], DrainOptions())
+    assert result.drained_pods == []
+
+
+# ── drain: grace_period_seconds ───────────────────────────────────────────────
+
+def test_drain_passes_grace_period_to_eviction():
+    pod = _make_pod("web-1", "default")
+    kube = _make_kube()
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=[pod]),
+        MagicMock(items=[]),
+    ]
+    _svc().drain("test", "worker-1", kube, DrainOptions(grace_period_seconds=30))
+
+    body = kube.create_namespaced_pod_eviction.call_args.kwargs["body"]
+    assert body.delete_options.grace_period_seconds == 30
+
+
+def test_drain_passes_grace_period_to_delete_when_eviction_disabled():
+    pod = _make_pod("web-1", "default")
+    kube = _make_kube()
+    kube.list_pod_for_all_namespaces.side_effect = [
+        MagicMock(items=[pod]),
+        MagicMock(items=[]),
+    ]
+    _svc().drain(
+        "test", "worker-1", kube,
+        DrainOptions(disable_eviction=True, grace_period_seconds=0),
+    )
+    assert kube.delete_namespaced_pod.call_args.kwargs["grace_period_seconds"] == 0
+
+
+@pytest.mark.parametrize(
+    "grace, expected_forced",
+    [(None, False), (0, True), (30, False)],
+)
+def test_drain_flags_forced_deletion_only_for_grace_zero(grace, expected_forced):
+    """grace=0 kills immediately with no graceful shutdown, so the response says
+    so. None (use the pod's own setting) and a positive value do not."""
+    result = _drain_with(
+        [_make_pod("web-1", "default")],
+        DrainOptions(grace_period_seconds=grace),
+    )
+    assert result.forced_deletion is expected_forced
+
+
+def test_drain_rejects_negative_grace_period():
+    """A negative grace period is always a caller bug — reject it in the model
+    rather than spending a Kubernetes round-trip to be told the same."""
+    with pytest.raises(ValidationError):
+        DrainOptions(grace_period_seconds=-1)
+
+
+# ── drain: full option matrix ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("delete_emptydir_data", [False, True])
+@pytest.mark.parametrize("disable_eviction", [False, True])
+@pytest.mark.parametrize("grace_period_seconds", [None, 0, 30])
+def test_drain_option_matrix(force, delete_emptydir_data, disable_eviction, grace_period_seconds):
+    """Every combination of the four flags against one pod of each guarded kind.
+
+    A pod is drained only when its guard is lifted; the drain is refused when
+    any guard still applies. disable_eviction and grace_period_seconds change
+    *how* pods leave, never *whether* they may — so they must not affect which
+    pods are blocked.
+    """
+    options = DrainOptions(
+        force=force,
+        delete_emptydir_data=delete_emptydir_data,
+        disable_eviction=disable_eviction,
+        grace_period_seconds=grace_period_seconds,
+    )
+    pods = [
+        _make_pod("web-1", "default"),                          # always eligible
+        _make_pod("bare-pod", "default", owner_kind=None),      # needs force
+        _make_pod("cache-1", "default", empty_dir=True),        # needs emptydir
+        _make_pod("ds-1", "kube-system", owner_kind="DaemonSet"),  # always skipped
+    ]
+
+    expected_required = {}
+    if not force:
+        expected_required["force"] = True
+    if not delete_emptydir_data:
+        expected_required["delete_emptydir_data"] = True
+
+    if expected_required:
+        with pytest.raises(DrainBlockedException) as exc_info:
+            _drain_with(pods, options)
+        assert exc_info.value.detail["required_options"] == expected_required
+        return
+
+    result = _drain_with(pods, options)
+    # DaemonSet is skipped regardless; the other three are all unblocked here.
+    assert sorted(p.name for p in result.drained_pods) == ["bare-pod", "cache-1", "web-1"]
+    assert result.forced_deletion is (grace_period_seconds == 0)
 
 
 # ── label_node ────────────────────────────────────────────────────────────────
