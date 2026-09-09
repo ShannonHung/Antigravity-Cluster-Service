@@ -104,38 +104,49 @@ def scenarios(kube):
 
 
 def _reset_namespace(kube, timeout: int = 90) -> None:
-    """Delete the scenario namespace and wait until it is really gone.
+    """Empty the scenario namespace, keeping the namespace itself.
 
-    ``slow-terminator`` traps SIGTERM and has a 120s grace period, so an
-    ordinary delete leaves the namespace stuck in Terminating far longer than a
-    test can wait. Applying into a Terminating namespace appears to succeed and
-    then has its resources garbage-collected, which would hang the next test
-    waiting for pods that can never appear — so the grace period is forced to
-    zero and we block until the namespace is actually absent.
+    Deleting and recreating a namespace per test is inherently racy: deletion is
+    asynchronous and finalises well after ``get namespace`` stops returning it,
+    so the next ``apply`` lands either on a Terminating namespace (rejected) or
+    on one that still exists (AlreadyExists). Both were observed.
+
+    Deleting only the *contents* removes the race entirely — the namespace is
+    created once and never torn down, so there is no window in which it is
+    half-gone. ``slow-terminator`` traps SIGTERM and would otherwise hold a
+    120s grace period, hence the forced grace of zero.
     """
+    _kubectl("create", "namespace", NAMESPACE, check=False)
+
+    # Delete every kind the manifests create. Pods are forced because one of
+    # them ignores SIGTERM by design.
+    _kubectl(
+        "delete", "all", "--all", "-n", NAMESPACE,
+        "--grace-period=0", "--force", "--wait=false", check=False,
+    )
+    _kubectl(
+        "delete", "poddisruptionbudget", "--all", "-n", NAMESPACE,
+        "--wait=false", check=False,
+    )
     _kubectl(
         "delete", "pod", "--all", "-n", NAMESPACE,
         "--grace-period=0", "--force", "--wait=false", check=False,
     )
-    _kubectl("delete", "namespace", NAMESPACE, "--ignore-not-found",
-             "--wait=false", check=False)
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        existing = _kubectl(
-            "get", "namespace", NAMESPACE,
-            "--ignore-not-found", "-o", "name", check=False,
-        ).strip()
-        if not existing:
+        if not kube.list_namespaced_pod(NAMESPACE).items:
             return
-        # Pods created between the delete and now keep the namespace alive.
         _kubectl(
             "delete", "pod", "--all", "-n", NAMESPACE,
             "--grace-period=0", "--force", "--wait=false", check=False,
         )
         time.sleep(2)
 
-    raise RuntimeError(f"namespace {NAMESPACE} still terminating after {timeout}s")
+    remaining = [p.metadata.name for p in kube.list_namespaced_pod(NAMESPACE).items]
+    raise RuntimeError(
+        f"namespace {NAMESPACE} still holds pods after {timeout}s: {remaining}"
+    )
 
 
 def _wait_for_scenarios(kube, timeout: int = 120) -> None:
