@@ -14,7 +14,12 @@ import pytest
 from kubernetes.client.exceptions import ApiException
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
-from app.core.exceptions import DrainBlockedException, KubeApiException, NodeNotFoundException
+from app.core.exceptions import (
+    DrainBlockedException,
+    KubeApiException,
+    NodeNotFoundException,
+    NodeNotReadyException,
+)
 from app.domain.kubernetes_models import DrainActionData, DrainOptions, NodeActionData, NodeListData, NodeTaintData, PodListData, TaintRemoveSpec, TaintSpec
 from pydantic import ValidationError
 
@@ -198,6 +203,7 @@ def test_cordon_raises_kube_api_exception_on_500():
 
 def test_uncordon_patches_unschedulable_false():
     kube = _make_kube()
+    kube.read_node.return_value = _make_node("worker-1", ready=True)
     result = _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
 
     assert kube.patch_node.call_count == 1
@@ -207,10 +213,58 @@ def test_uncordon_patches_unschedulable_false():
 
 
 def test_uncordon_raises_node_not_found_on_404():
+    """A missing node is a 404, not a 409: the readiness gate is downstream of
+    the read, so it never gets the chance to mislabel an absent node."""
     kube = _make_kube()
-    kube.patch_node.side_effect = _api_error(404)
+    kube.read_node.side_effect = _api_error(404)
     with pytest.raises(NodeNotFoundException):
         _svc().uncordon(cluster="test", node_name="missing", kube=kube)
+
+
+# ── uncordon: readiness gate ─────────────────────────────────────────────────
+
+def test_uncordon_refuses_not_ready_node():
+    """Uncordoning declares a node fit for work; a NotReady node is not."""
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node("worker-1", ready=False)
+
+    with pytest.raises(NodeNotReadyException) as exc_info:
+        _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
+
+    exc = exc_info.value
+    assert exc.http_status == 409
+    assert exc.detail == {"node": "worker-1", "status": "NotReady"}
+    # Nothing was patched — the node keeps whatever schedulability it had.
+    kube.patch_node.assert_not_called()
+
+
+def test_uncordon_refuses_node_with_unknown_status():
+    """An absent Ready condition means the kubelet is out of contact — a worse
+    signal than NotReady, so it must not slip through a NotReady-only check."""
+    kube = _make_kube()
+    node = _make_node("worker-1")
+    node.status.conditions = []
+    kube.read_node.return_value = node
+
+    with pytest.raises(NodeNotReadyException) as exc_info:
+        _svc().uncordon(cluster="test", node_name="worker-1", kube=kube)
+
+    assert exc_info.value.detail["status"] == "Unknown"
+    kube.patch_node.assert_not_called()
+
+
+def test_cordon_is_not_gated_on_readiness():
+    """Cordoning an unhealthy node is exactly what an operator should be able to
+    do — the gate belongs on uncordon only."""
+    kube = _make_kube()
+    kube.read_node.return_value = _make_node("worker-1", ready=False)
+
+    result = _svc().cordon(cluster="test", node_name="worker-1", kube=kube)
+
+    assert result.action == "cordon"
+    assert kube.patch_node.call_args_list[0][0][1] == {
+        "spec": {"unschedulable": True}
+    }
 
 
 # ── drain ─────────────────────────────────────────────────────────────────────
@@ -1000,8 +1054,16 @@ def test_cordon_many_deduplicates_node_names():
     assert kube.patch_node.call_count == 2
 
 
+def _stub_node_statuses(kube: MagicMock, **ready_by_name: bool) -> None:
+    """Make ``list_node`` report the given nodes with the given readiness."""
+    kube.list_node.return_value = MagicMock(
+        items=[_make_node(name, ready=ready) for name, ready in ready_by_name.items()]
+    )
+
+
 def test_uncordon_many_patches_unschedulable_false():
     kube = _make_kube()
+    _stub_node_statuses(kube, n1=True, n2=True)
 
     result = _svc().uncordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
 
@@ -1011,6 +1073,78 @@ def test_uncordon_many_patches_unschedulable_false():
         call("n1", {"spec": {"unschedulable": False}}),
         call("n2", {"spec": {"unschedulable": False}}),
     ])
+
+
+def test_uncordon_many_reads_readiness_once_for_the_whole_batch():
+    """One listing, not one read per node — the cost of the gate must not scale
+    with batch size."""
+    kube = _make_kube()
+    _stub_node_statuses(kube, n1=True, n2=True, n3=True)
+
+    _svc().uncordon_many(cluster="test", node_names=["n1", "n2", "n3"], kube=kube)
+
+    assert kube.list_node.call_count == 1
+    kube.read_node.assert_not_called()
+
+
+def test_uncordon_many_fails_only_the_not_ready_nodes():
+    """A NotReady node fails on its own and never aborts the batch."""
+    kube = _make_kube()
+    _stub_node_statuses(kube, n1=True, n2=False, n3=True)
+
+    result = _svc().uncordon_many(
+        cluster="test", node_names=["n1", "n2", "n3"], kube=kube,
+    )
+
+    assert result.summary.succeeded == 2
+    assert result.summary.failed == 1
+    failed = [r for r in result.results if r.status == "failed"]
+    assert [r.node for r in failed] == ["n2"]
+    assert failed[0].error_code == "NODE_NOT_READY"
+    assert failed[0].kube_status == 409
+    # The healthy nodes were still patched.
+    kube.patch_node.assert_has_calls([
+        call("n1", {"spec": {"unschedulable": False}}),
+        call("n3", {"spec": {"unschedulable": False}}),
+    ])
+
+
+def test_uncordon_many_all_not_ready_is_still_per_node():
+    """Every node failing looks like a cluster problem but is not evidence of
+    one — the batch must not promote a guess into a propagated exception."""
+    kube = _make_kube()
+    _stub_node_statuses(kube, n1=False, n2=False)
+
+    result = _svc().uncordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
+
+    assert result.summary.failed == 2
+    assert result.summary.succeeded == 0
+    assert all(r.error_code == "NODE_NOT_READY" for r in result.results)
+    kube.patch_node.assert_not_called()
+
+
+def test_uncordon_many_node_absent_from_listing_yields_404_not_409():
+    """A node missing from the listing is gone, not unhealthy. Letting the patch
+    run produces the real 404 instead of inventing a readiness verdict."""
+    kube = _make_kube()
+    _stub_node_statuses(kube, n1=True)
+    kube.patch_node.side_effect = _api_error(404)
+
+    result = _svc().uncordon_many(cluster="test", node_names=["ghost"], kube=kube)
+
+    assert result.summary.failed == 1
+    assert result.results[0].error_code == "NODE_NOT_FOUND"
+
+
+def test_cordon_many_does_not_check_readiness():
+    """Cordoning is how an operator responds to a sick node — never gated, and
+    it must not pay for a listing it does not use."""
+    kube = _make_kube()
+
+    result = _svc().cordon_many(cluster="test", node_names=["n1", "n2"], kube=kube)
+
+    assert result.summary.succeeded == 2
+    kube.list_node.assert_not_called()
 
 
 def test_cordon_many_patches_unschedulable_true():

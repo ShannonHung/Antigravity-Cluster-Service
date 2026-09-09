@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.api.v1.nodes import _get_cluster_repo, _get_node_service
+from app.core.exceptions import NodeNotReadyException
 from app.domain.kubernetes_models import (
     BatchNodeActionData,
     BatchNodeResult,
@@ -156,3 +157,59 @@ def test_batch_cordon_strips_whitespace_from_node_names(client, fake_service):
         headers=_auth(client),
     )
     assert fake_service.cordon_many.call_args.kwargs["node_names"] == ["n1", "n2"]
+
+
+# ── uncordon readiness gate ──────────────────────────────────────────────────
+
+def test_uncordon_not_ready_returns_409_envelope(client, fake_service):
+    """The gate must surface as 409 with the standard error envelope.
+
+    409 rather than 400 because the request is well-formed and no parameter
+    would change the outcome — what has to change is the node.
+    """
+    fake_service.uncordon.side_effect = NodeNotReadyException(
+        node_name="n1", status="NotReady",
+    )
+
+    r = client.post(
+        "/api/v1/clusters/c1/nodes/n1/uncordon", headers=_auth(client),
+    )
+
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["code"] == "NODE_NOT_READY"
+    assert body["error"]["detail"] == {"node": "n1", "status": "NotReady"}
+    assert "request_id" in body
+
+
+def test_batch_uncordon_reports_not_ready_per_node(client, fake_service):
+    """A NotReady node is a per-node failure: the batch still returns 200 and
+    the nodes that succeeded are still reported."""
+    fake_service.uncordon_many.return_value = BatchNodeActionData(
+        cluster="c1",
+        action="uncordon",
+        summary=BatchSummary(total=2, succeeded=1, failed=1),
+        results=[
+            BatchNodeResult(node="n1", status="success"),
+            BatchNodeResult(
+                node="n2",
+                status="failed",
+                error_code="NODE_NOT_READY",
+                message="Node 'n2' is NotReady, so it cannot be uncordoned.",
+                kube_status=409,
+            ),
+        ],
+    )
+
+    r = client.post(
+        "/api/v1/clusters/c1/nodes:uncordon",
+        json={"nodes": ["n1", "n2"]},
+        headers=_auth(client),
+    )
+
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["summary"] == {"total": 2, "succeeded": 1, "failed": 1}
+    failed = [x for x in data["results"] if x["status"] == "failed"]
+    assert failed[0]["error_code"] == "NODE_NOT_READY"
+    assert failed[0]["kube_status"] == 409

@@ -34,6 +34,7 @@ from app.core.exceptions import (
     DrainBlockedException,
     KubeApiException,
     NodeNotFoundException,
+    NodeNotReadyException,
 )
 from app.domain.kubernetes_models import (
     BatchNodeActionData,
@@ -170,19 +171,7 @@ class NodeService:
             NodeNotFoundException: If the node does not exist.
             KubeApiException: On Kubernetes API failure.
         """
-        try:
-            node = kube.read_node(node_name)
-        except ApiException as exc:
-            if exc.status == 404:
-                raise NodeNotFoundException(
-                    f"Node '{node_name}' not found in cluster '{cluster}'.",
-                ) from exc
-            raise KubeApiException(
-                f"Failed to read node '{node_name}': {exc.reason}",
-                kube_status=exc.status,
-            ) from exc
-        except Urllib3HTTPError as exc:
-            raise _connection_error(cluster, exc) from exc
+        node = self._read_node(cluster, node_name, kube)
 
         info = self._node_to_info(node)
         taints = [self._to_taint_spec(t) for t in (node.spec.taints or [])]
@@ -215,12 +204,30 @@ class NodeService:
     # ── Uncordon ──────────────────────────────────────────────────────────────
 
     def uncordon(self, cluster: str, node_name: str, kube: CoreV1Api) -> NodeActionData:
-        """Re-enable scheduling.
+        """Re-enable scheduling, but only on a node that is currently Ready.
+
+        The readiness gate has no override. Uncordoning states that the node is
+        fit for work, and there is no request the caller can send that makes an
+        unhealthy node fit — so the fix is always to the node, never to the call.
+
+        This guards against acting on a stale view of the cluster; it does not
+        make scheduling safe. See NodeNotReadyException for why a flapping node
+        still gets filled.
 
         Raises:
             NodeNotFoundException: If the node does not exist.
+            NodeNotReadyException: If the node is not Ready (409).
             KubeApiException: On Kubernetes API failure.
         """
+        node = self._read_node(cluster, node_name, kube)
+        status = self._node_status(node)
+        if status != "Ready":
+            _logger.warning(
+                "Refused uncordon of non-Ready node | cluster=%s | node=%s | status=%s",
+                cluster, node_name, status,
+            )
+            raise NodeNotReadyException(node_name=node_name, status=status)
+
         self._patch_unschedulable(cluster, node_name, kube, unschedulable=False)
         _logger.info("Uncordoned node | cluster=%s | node=%s", cluster, node_name)
         return NodeActionData(cluster=cluster, node=node_name, action="uncordon")
@@ -292,16 +299,41 @@ class NodeService:
         callers can tell "the cluster is down" from "these nodes are bad"
         instead of reading N identical per-node errors. Any unexpected
         exception type propagates too, rather than being silently downgraded.
+
+        Uncordon additionally requires each node to be Ready. Readiness for the
+        whole batch comes from one ``list_node`` rather than a read per node:
+        100 nodes would otherwise cost 100 extra round-trips to answer a
+        question one listing already answers. A node that is not Ready — or is
+        missing from the listing entirely — fails only itself, even when every
+        node in the batch fails that way. "All of them failed" looks like a
+        cluster problem but is not evidence of one, and `_is_cluster_level`
+        stays keyed on signals that are certain (connection errors, 401/403)
+        rather than on a guess.
         """
         results: list[BatchNodeResult] = []
+        statuses = (
+            self._node_statuses(cluster, kube) if not unschedulable else {}
+        )
 
         for node_name in dict.fromkeys(node_names):
             try:
+                if not unschedulable:
+                    # Missing from the listing means the node is gone; let the
+                    # patch produce the usual 404 rather than inventing one.
+                    status = statuses.get(node_name)
+                    if status is not None and status != "Ready":
+                        raise NodeNotReadyException(
+                            node_name=node_name, status=status,
+                        )
                 self._patch_unschedulable(
                     cluster, node_name, kube, unschedulable=unschedulable,
                 )
                 results.append(BatchNodeResult(node=node_name, status="success"))
-            except (NodeNotFoundException, KubeApiException) as exc:
+            except (
+                NodeNotFoundException,
+                NodeNotReadyException,
+                KubeApiException,
+            ) as exc:
                 if self._is_cluster_level(exc):
                     raise
                 # NodeNotFoundException carries no kube_status of its own — it is
@@ -704,6 +736,26 @@ class NodeService:
         node = self._read_node(cluster, node_name, kube)
         return node.metadata.annotations or {}
 
+    def _node_statuses(self, cluster: str, kube: CoreV1Api) -> dict[str, str]:
+        """Map every node name in the cluster to its readiness, in one call.
+
+        Used by the batch uncordon gate so N nodes cost one listing rather than
+        N reads. A failure here is cluster-level by construction — the listing
+        is not about any single node — so it propagates rather than being
+        recorded against whichever node happened to be first.
+        """
+        try:
+            node_list = kube.list_node()
+        except ApiException as exc:
+            raise KubeApiException(
+                f"Failed to list nodes in cluster '{cluster}': {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+        except Urllib3HTTPError as exc:
+            raise _connection_error(cluster, exc) from exc
+
+        return {n.metadata.name: self._node_status(n) for n in node_list.items}
+
     def _read_node(self, cluster: str, node_name: str, kube: CoreV1Api):
         """Read a node, mapping 404 → NodeNotFoundException."""
         try:
@@ -834,13 +886,23 @@ class NodeService:
             time.sleep(2)
 
     @staticmethod
-    def _node_to_info(node: V1Node) -> NodeInfo:
-        """Convert a V1Node object to a NodeInfo response model."""
-        status = "Unknown"
+    def _node_status(node: V1Node) -> str:
+        """Derive a node's readiness: "Ready", "NotReady" or "Unknown".
+
+        "Unknown" means the Ready condition is absent — the node controller has
+        lost contact with the kubelet. It is a *worse* signal than NotReady, not
+        a milder one, so callers gating on health must treat only "Ready" as
+        passing rather than listing the bad values.
+        """
         for cond in (node.status.conditions or []):
             if cond.type == "Ready":
-                status = "Ready" if cond.status == "True" else "NotReady"
-                break
+                return "Ready" if cond.status == "True" else "NotReady"
+        return "Unknown"
+
+    @staticmethod
+    def _node_to_info(node: V1Node) -> NodeInfo:
+        """Convert a V1Node object to a NodeInfo response model."""
+        status = NodeService._node_status(node)
 
         labels = node.metadata.labels or {}
         roles = [
