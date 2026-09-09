@@ -29,6 +29,53 @@ class HostType(str, Enum):
     CLUSTER = "cluster"
 
 
+class OutputFormat(str, Enum):
+    """How the caller wants a command's ``output`` returned on the poll endpoint.
+
+    Mirrors deploy-service's ``OutputFormat``. ``raw`` (the default) is the
+    historical response — ``output`` stays a string and the JSON fields stay
+    null. ``json`` asks deploy-service to additionally parse ``output`` into
+    ``output_json`` (permitted only for commands whose whitelist entry declares
+    ``output_format: "json"``). cluster-service only forwards this as the
+    ``?format=`` query param; the parsing itself happens upstream.
+    """
+
+    RAW = "raw"
+    JSON = "json"
+
+
+class CommandOutputFormat(str, Enum):
+    """The operator's declaration of what a command emits on stdout.
+
+    Part of the command's contract, not the caller's preference: declaring
+    ``json`` PERMITS ``?format=json``, it never triggers parsing on its own.
+    Surfaced in the ``/command/.../info`` responses cluster-service proxies so
+    callers can discover which commands accept ``?format=json``.
+    """
+
+    TEXT = "text"
+    JSON = "json"
+
+
+class OutputJsonError(str, Enum):
+    """Why ``output_json`` is null even though ``?format=json`` was requested.
+
+    Mirrored verbatim from deploy-service so the proxied value round-trips as a
+    typed enum rather than a bare string:
+
+    - ``parse_failed`` — the command declared ``output_format: "json"`` but its
+      stdout was not valid JSON (the remote script broke its own contract).
+    - ``output_unavailable`` — the command succeeded, but its stdout was lost
+      during cross-pod orphan-run recovery.
+    - ``not_applicable`` — the command is not in a success state, so there was
+      never stdout to parse.
+    """
+
+    PARSE_FAILED = "parse_failed"
+    OUTPUT_UNAVAILABLE = "output_unavailable"
+    NOT_APPLICABLE = "not_applicable"
+
+
 # ── Whitelist configuration ──────────────────────────────────────────────────
 
 class CommandArgumentConfig(BaseModel):
@@ -54,6 +101,11 @@ class CommandWhitelistConfig(BaseModel):
     # actual version check runs on deploy-service, so no validator is mirrored.
     checks_script_version: bool = False
     min_script_version: Optional[str] = None
+    # Operator's declaration of the command's stdout contract. "json" is what
+    # PERMITS a caller to ask for ?format=json on the poll endpoint; cluster-service
+    # only surfaces it here so callers can discover which commands accept it (the
+    # permission check and parsing both run upstream on deploy-service).
+    output_format: CommandOutputFormat = CommandOutputFormat.TEXT
     pipeline: List[PipelineStep]
     arguments: List[CommandArgumentConfig] = []
 
@@ -98,6 +150,15 @@ class CommandExecutionResponse(BaseModel):
     host_type: Optional[HostType] = None
     resolved_ip: Optional[str] = None
     pgids: List[int] = Field(default_factory=list)
+
+    # ── Parsed output (populated only by GET /execution/{id}?format=json) ──
+    # ``output`` above always keeps its raw string value; these are purely
+    # additive so a caller that never passes ?format=json sees an unchanged
+    # response. Both are produced upstream on deploy-service and forwarded
+    # verbatim. ``output_json`` is typed ``Any`` because the source script may
+    # legitimately emit an object, an array, or a scalar.
+    output_json: Optional[Any] = None
+    output_json_error: Optional[OutputJsonError] = None
 
 
 class CommandLogLine(BaseModel):

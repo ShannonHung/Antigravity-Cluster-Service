@@ -8,6 +8,7 @@ from app.core.exceptions import DeployServiceError
 from app.domain.command_models import (
     CommandExecutionRequest,
     CommandExecutionResponse,
+    OutputFormat,
     UserCommandWhitelist,
 )
 from app.services.command_service import CommandService
@@ -50,6 +51,18 @@ async def test_execute_delegates_and_passes_body():
     resp = await svc.execute_command(body)
     assert resp.command_id == "abc"
     svc._client.execute_command.assert_awaited_once_with(body)
+
+
+async def test_get_result_defaults_to_raw_format():
+    svc = _service()
+    await svc.get_result("abc")
+    svc._client.get_command_result.assert_awaited_once_with("abc", OutputFormat.RAW)
+
+
+async def test_get_result_forwards_json_format():
+    svc = _service()
+    await svc.get_result("abc", OutputFormat.JSON)
+    svc._client.get_command_result.assert_awaited_once_with("abc", OutputFormat.JSON)
 
 
 async def test_kill_forwards_force_flag():

@@ -33,6 +33,7 @@ from app.domain.command_models import (
     CommandExecutionResponse,
     CommandTraceResponse,
     CommandWhitelistConfig,
+    OutputFormat,
     UserCommandWhitelist,
 )
 from app.domain.models import ApiResponse, User
@@ -108,14 +109,34 @@ async def execute_command(
     "/execution/{command_id}",
     response_model=ApiResponse[CommandExecutionResponse],
     summary="Poll command execution result",
+    description=(
+        "Returns a command's current status and result.\n\n"
+        "`format=raw` (the default) is the historical response. `format=json` "
+        "additionally parses the command's stdout into `output_json`, and is "
+        "accepted only for commands whose whitelist entry declares "
+        '`output_format: "json"` (see GET /command/{command_name}/info) — '
+        "asking for it on any other command is a 400 from deploy-service. "
+        "`output` itself always keeps its raw string value; when parsing does "
+        "not happen, `output_json_error` says why."
+    ),
 )
 async def get_command_execution_status(
     command_id: str,
     request: Request,
+    # Named `output_format` in Python but exposed as `?format=` via alias, to
+    # match deploy-service's public query contract; the value is forwarded verbatim.
+    output_format: OutputFormat = Query(
+        default=OutputFormat.RAW,
+        alias="format",
+        description=(
+            "raw = unchanged response; json = also parse stdout into "
+            "output_json (requires the command to declare output_format json)."
+        ),
+    ),
     svc: CommandService = Depends(_get_command_service),
     current_user: Annotated[User, Depends(get_current_user(["command_api"]))] = None,
 ) -> ApiResponse[CommandExecutionResponse]:
-    data = await svc.get_result(command_id)
+    data = await svc.get_result(command_id, output_format)
     return ApiResponse(data=data, request_id=_request_id(request))
 
 

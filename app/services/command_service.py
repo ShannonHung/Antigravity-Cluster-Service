@@ -15,6 +15,7 @@ from app.domain.command_models import (
     CommandExecutionResponse,
     CommandTraceResponse,
     CommandWhitelistConfig,
+    OutputFormat,
     UserCommandWhitelist,
 )
 
@@ -42,8 +43,10 @@ class CommandService:
         )
         return await self._client.execute_command(body)
 
-    async def get_result(self, command_id: str) -> CommandExecutionResponse:
-        return await self._client.get_command_result(command_id)
+    async def get_result(
+        self, command_id: str, output_format: OutputFormat = OutputFormat.RAW
+    ) -> CommandExecutionResponse:
+        return await self._client.get_command_result(command_id, output_format)
 
     async def kill(self, command_id: str, force: bool = False) -> CommandExecutionResponse:
         _logger.info("Proxying kill | command_id=%s | force=%s", command_id, force)

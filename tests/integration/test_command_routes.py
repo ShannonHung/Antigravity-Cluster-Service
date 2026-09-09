@@ -95,6 +95,40 @@ def test_get_execution_status(client, fake_service):
     assert r.status_code == 200, r.text
     assert r.json()["data"]["command_id"] == "abc"
     assert r.json()["data"]["status"] == "success"
+    # Default format is raw when the caller omits ?format=.
+    from app.domain.command_models import OutputFormat
+    fake_service.get_result.assert_awaited_once_with("abc", OutputFormat.RAW)
+
+
+def test_get_execution_status_forwards_json_format(client, fake_service):
+    from app.domain.command_models import OutputFormat
+
+    fake_service.get_result = AsyncMock(
+        return_value=CommandExecutionResponse(
+            command_id="abc",
+            status="success",
+            output='{"ok": true}',
+            output_json={"ok": True},
+        )
+    )
+    token = _login(client)
+    r = client.get(
+        "/api/v1/command/execution/abc?format=json",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["output_json"] == {"ok": True}
+    fake_service.get_result.assert_awaited_once_with("abc", OutputFormat.JSON)
+
+
+def test_get_execution_status_rejects_bad_format(client, fake_service):
+    token = _login(client)
+    r = client.get(
+        "/api/v1/command/execution/abc?format=xml",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    # An unknown enum value is a 422 at the boundary before any proxying.
+    assert r.status_code == 422
 
 
 def test_get_command_info(client, fake_service):
