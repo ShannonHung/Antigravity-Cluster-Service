@@ -123,7 +123,16 @@ async def cordon_node(
     "/{cluster}/nodes/{node}/uncordon",
     response_model=ApiResponse[NodeActionData],
     summary="Uncordon a node",
-    description="Re-enables scheduling on the node.",
+    description=(
+        "Re-enables scheduling on the node.\n\n"
+        "The node must currently be **Ready**. Uncordoning declares a node fit "
+        "to receive pods, so this is refused with 409 `NODE_NOT_READY` for a "
+        "NotReady or Unknown node — there is no override, because no change to "
+        "the request can make an unhealthy node healthy.\n\n"
+        "Note this guards against acting on a stale view of the cluster, not "
+        "against instability: an uncordoned node that flaps in and out of Ready "
+        "will still be filled during its Ready windows."
+    ),
 )
 async def uncordon_node(
     request: Request,
@@ -183,7 +192,14 @@ async def cordon_nodes(
     summary="Uncordon several nodes",
     description=(
         "Re-enables scheduling on each listed node. Response semantics match "
-        "the batch cordon endpoint."
+        "the batch cordon endpoint.\n\n"
+        "Each node must be Ready; one that is not fails on its own with "
+        "`NODE_NOT_READY` and never aborts the batch — including when every "
+        "node in the batch fails that way.\n\n"
+        "Readiness for the whole batch comes from a single `list nodes` call, "
+        "so the credentials for this cluster need **list** on nodes in addition "
+        "to **patch**. A token holding only patch fails the batch outright "
+        "rather than returning per-node results."
     ),
 )
 async def uncordon_nodes(
@@ -309,7 +325,7 @@ async def patch_node_labels(
     current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))] = None,
     repo: ClusterRepository = Depends(_get_cluster_repo),
     svc: NodeService = Depends(_get_node_service),
-) -> ApiResponse[NodeMetadataData]:
+) -> ApiResponse[NodeLabelsData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = await asyncio.to_thread(
@@ -342,7 +358,7 @@ async def patch_node_annotations(
     current_user: Annotated[User, Depends(get_current_user(["cluster_api"]))] = None,
     repo: ClusterRepository = Depends(_get_cluster_repo),
     svc: NodeService = Depends(_get_node_service),
-) -> ApiResponse[NodeMetadataData]:
+) -> ApiResponse[NodeAnnotationsData]:
     cfg = repo.get_kube_client_config(cluster)
     kube = KubeClientFactory().get_core_v1(cfg)
     data = await asyncio.to_thread(

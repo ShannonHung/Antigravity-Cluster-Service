@@ -69,7 +69,8 @@ class ErrorCode(StrEnum):
     NODE_NOT_FOUND             = "NODE_NOT_FOUND"
     NODE_OPERATION_FAILED      = "NODE_OPERATION_FAILED"
     KUBE_API_ERROR             = "KUBE_API_ERROR"
-    DRAIN_TIMEOUT              = "DRAIN_TIMEOUT"
+    DRAIN_BLOCKED              = "DRAIN_BLOCKED"
+    NODE_NOT_READY             = "NODE_NOT_READY"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -278,6 +279,45 @@ class NodeNotFoundException(BaseAppException):
     log_level = logging.INFO
 
 
+class NodeNotReadyException(BaseAppException):
+    """Raised when uncordon is asked for a node that is not Ready.
+
+    Uncordoning is a promise that the node is fit to take work. Making that
+    promise about a node the cluster currently considers unhealthy is almost
+    always a mistake — usually someone acting on a stale view of the cluster.
+
+    409, not 400: the request is well-formed and there is no parameter that
+    would make it succeed. What has to change is the node, not the call. A 400
+    would send the caller looking for a mistake in their own request.
+
+    Note what this does **not** protect against. ``spec.unschedulable`` and the
+    Ready condition are independent: an uncordoned NotReady node takes no pods
+    *while* it is NotReady, and the scheduler fills it the moment it goes Ready.
+    A node that flaps therefore still gets filled during any Ready window, and
+    this check — evaluated once, at request time — cannot see that coming. It
+    catches operator error, not instability.
+
+    The check is also not atomic with the patch that follows it: a node can go
+    NotReady in between, and in a batch the readiness snapshot is taken once up
+    front, so the last node of a large batch is judged on a reading several
+    round-trips old. Kubernetes offers no compare-and-set on this path, and the
+    failure mode is benign — an uncordoned node that has just gone NotReady
+    takes no pods until it recovers.
+    """
+
+    http_status = 409
+    error_code = ErrorCode.NODE_NOT_READY
+    log_level = logging.WARNING
+
+    def __init__(self, node_name: str, status: str) -> None:
+        super().__init__(
+            f"Node '{node_name}' is {status}, so it cannot be uncordoned. "
+            f"Uncordoning declares the node fit to receive pods; wait for it "
+            f"to report Ready, or investigate why it is not.",
+            detail={"node": node_name, "status": status},
+        )
+
+
 class KubeApiException(BaseAppException):
     """Raised when the Kubernetes API returns an unexpected error.
 
@@ -300,79 +340,63 @@ class KubeApiException(BaseAppException):
         super().__init__(message, **kwargs)
 
 
-class DrainTimeoutException(BaseAppException):
-    """Raised when a node drain does not finish within its timeout budget.
+class DrainBlockedException(BaseAppException):
+    """Raised when a drain would touch pods that its options do not permit.
 
-    The app deliberately times out *before* any front proxy would, so the caller
-    receives this structured 504 (naming the pods still running and hinting that
-    drain can be safely retried) instead of a bare gateway 500.
+    Mirrors ``kubectl drain``'s refusal semantics: a pod with no controller, or
+    one using an emptyDir volume, is protected unless the caller explicitly
+    opts out. The check runs **before any pod is evicted**, so a rejected drain
+    changes nothing on the cluster and the caller learns every blocker in one
+    round-trip rather than discovering them one eviction at a time.
 
-    Drain is idempotent: the node stays cordoned, so re-invoking drain simply
-    continues evicting whatever is left. When pods refuse to leave under a plain
-    drain, ``detail.suggested_options`` recommends the stronger flags the caller
-    has not enabled yet (force / disable_eviction / grace 0 / delete emptyDir).
+    The node is left cordoned — cordoning is what a drain is for, is harmless
+    on its own, and re-running with the right flags then has nothing to redo.
     """
 
-    http_status = 504
-    error_code = ErrorCode.DRAIN_TIMEOUT
+    http_status = 400
+    error_code = ErrorCode.DRAIN_BLOCKED
     log_level = logging.WARNING
 
-    def __init__(
-        self,
-        node_name: str,
-        timeout_seconds: int,
-        still_running: list[tuple[str, str]],
-        current_options: Any = None,
-    ) -> None:
-        pods = [{"namespace": ns, "name": name} for ns, name in sorted(still_running)]
-        suggested = self._suggest_stronger_options(current_options)
+    #: Reason → the option that unblocks it. Order fixes the message ordering.
+    UNBLOCKING_OPTION = {
+        "unmanaged": "force",
+        "emptydir": "delete_emptydir_data",
+    }
+
+    def __init__(self, node_name: str, blocked: list[dict]) -> None:
+        """``blocked`` — one entry per pod: ``{namespace, name, reasons: [...]}``."""
+        required = self._required_options(blocked)
 
         message = (
-            f"Drain of node '{node_name}' exceeded {timeout_seconds}s with "
-            f"{len(pods)} pod(s) still running. The node remains cordoned; "
-            f"you may safely retry the drain to continue evicting the "
-            f"remaining pods."
+            f"Drain of node '{node_name}' is blocked by {len(blocked)} pod(s) "
+            f"that the supplied options do not permit removing. No pod was "
+            f"evicted and the node is unchanged. Retry with: "
+            + ", ".join(f"{k}={v}" for k, v in required.items())
+            + "."
         )
-        if suggested:
-            message += (
-                " If they keep hanging, retry with stronger options: "
-                + ", ".join(f"{k}={v}" for k, v in suggested.items())
-                + "."
-            )
 
         super().__init__(
             message,
             detail={
                 "node": node_name,
-                "timeout_seconds": timeout_seconds,
-                "pods_still_running": pods,
-                "suggested_options": suggested,
+                "blocked_pods": blocked,
+                "required_options": required,
             },
         )
 
-    @staticmethod
-    def _suggest_stronger_options(current_options: Any) -> dict:
-        """Recommend the escalation flags the caller has NOT enabled yet.
+    @classmethod
+    def _required_options(cls, blocked: list[dict]) -> dict:
+        """Every option needed to unblock the whole set, not just the first pod.
 
-        Given the options used on the timed-out drain, offer only the stronger
-        settings that would actually add force — so an already-forceful request
-        is not told to re-enable what it already set.
+        A caller that fixes one blocker at a time pays a round-trip per blocker,
+        which is the slow discovery this endpoint exists to avoid.
         """
-        force = bool(getattr(current_options, "force", False))
-        disable_eviction = bool(getattr(current_options, "disable_eviction", False))
-        grace = getattr(current_options, "grace_period_seconds", None)
-        delete_emptydir = bool(getattr(current_options, "delete_emptydir_data", False))
-
-        suggested: dict = {}
-        if not force:
-            suggested["force"] = True
-        if not disable_eviction:
-            suggested["disable_eviction"] = True
-        if grace != 0:
-            suggested["grace_period_seconds"] = 0
-        if not delete_emptydir:
-            suggested["delete_emptydir_data"] = True
-        return suggested
+        reasons = {r for pod in blocked for r in pod.get("reasons", [])}
+        return {
+            option: True
+            for reason, option in cls.UNBLOCKING_OPTION.items()
+            if reason in reasons
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────

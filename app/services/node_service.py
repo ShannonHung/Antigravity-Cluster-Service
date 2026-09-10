@@ -31,9 +31,10 @@ from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from app.core.config import get_settings
 from app.core.exceptions import (
-    DrainTimeoutException,
+    DrainBlockedException,
     KubeApiException,
     NodeNotFoundException,
+    NodeNotReadyException,
 )
 from app.domain.kubernetes_models import (
     BatchNodeActionData,
@@ -42,6 +43,7 @@ from app.domain.kubernetes_models import (
     DrainActionData,
     DrainOptions,
     DrainedPodInfo,
+    StillTerminatingPodInfo,
     NodeActionData,
     NodeAnnotationsData,
     NodeDetailData,
@@ -169,19 +171,7 @@ class NodeService:
             NodeNotFoundException: If the node does not exist.
             KubeApiException: On Kubernetes API failure.
         """
-        try:
-            node = kube.read_node(node_name)
-        except ApiException as exc:
-            if exc.status == 404:
-                raise NodeNotFoundException(
-                    f"Node '{node_name}' not found in cluster '{cluster}'.",
-                ) from exc
-            raise KubeApiException(
-                f"Failed to read node '{node_name}': {exc.reason}",
-                kube_status=exc.status,
-            ) from exc
-        except Urllib3HTTPError as exc:
-            raise _connection_error(cluster, exc) from exc
+        node = self._read_node(cluster, node_name, kube)
 
         info = self._node_to_info(node)
         taints = [self._to_taint_spec(t) for t in (node.spec.taints or [])]
@@ -214,12 +204,30 @@ class NodeService:
     # ── Uncordon ──────────────────────────────────────────────────────────────
 
     def uncordon(self, cluster: str, node_name: str, kube: CoreV1Api) -> NodeActionData:
-        """Re-enable scheduling.
+        """Re-enable scheduling, but only on a node that is currently Ready.
+
+        The readiness gate has no override. Uncordoning states that the node is
+        fit for work, and there is no request the caller can send that makes an
+        unhealthy node fit — so the fix is always to the node, never to the call.
+
+        This guards against acting on a stale view of the cluster; it does not
+        make scheduling safe. See NodeNotReadyException for why a flapping node
+        still gets filled.
 
         Raises:
             NodeNotFoundException: If the node does not exist.
+            NodeNotReadyException: If the node is not Ready (409).
             KubeApiException: On Kubernetes API failure.
         """
+        node = self._read_node(cluster, node_name, kube)
+        status = self._node_status(node)
+        if status != "Ready":
+            _logger.warning(
+                "Refused uncordon of non-Ready node | cluster=%s | node=%s | status=%s",
+                cluster, node_name, status,
+            )
+            raise NodeNotReadyException(node_name=node_name, status=status)
+
         self._patch_unschedulable(cluster, node_name, kube, unschedulable=False)
         _logger.info("Uncordoned node | cluster=%s | node=%s", cluster, node_name)
         return NodeActionData(cluster=cluster, node=node_name, action="uncordon")
@@ -291,16 +299,47 @@ class NodeService:
         callers can tell "the cluster is down" from "these nodes are bad"
         instead of reading N identical per-node errors. Any unexpected
         exception type propagates too, rather than being silently downgraded.
+
+        Uncordon additionally requires each node to be Ready. Readiness for the
+        whole batch comes from one ``list_node`` rather than a read per node:
+        100 nodes would otherwise cost 100 extra round-trips to answer a
+        question one listing already answers. A node that is not Ready — or is
+        missing from the listing entirely — fails only itself, even when every
+        node in the batch fails that way. "All of them failed" looks like a
+        cluster problem but is not evidence of one, and `_is_cluster_level`
+        stays keyed on signals that are certain (connection errors, 401/403)
+        rather than on a guess.
         """
         results: list[BatchNodeResult] = []
+        # Only uncordon gates on readiness, and only when there is work to do:
+        # `_strip_node_names` drops blank entries after min_length validation,
+        # so an all-blank body arrives here empty and must not buy a listing
+        # for a loop that will not run.
+        statuses = (
+            self._node_statuses(cluster, kube)
+            if not unschedulable and node_names
+            else {}
+        )
 
         for node_name in dict.fromkeys(node_names):
             try:
+                if not unschedulable:
+                    # Missing from the listing means the node is gone; let the
+                    # patch produce the usual 404 rather than inventing one.
+                    status = statuses.get(node_name)
+                    if status is not None and status != "Ready":
+                        raise NodeNotReadyException(
+                            node_name=node_name, status=status,
+                        )
                 self._patch_unschedulable(
                     cluster, node_name, kube, unschedulable=unschedulable,
                 )
                 results.append(BatchNodeResult(node=node_name, status="success"))
-            except (NodeNotFoundException, KubeApiException) as exc:
+            except (
+                NodeNotFoundException,
+                NodeNotReadyException,
+                KubeApiException,
+            ) as exc:
                 if self._is_cluster_level(exc):
                     raise
                 # NodeNotFoundException carries no kube_status of its own — it is
@@ -376,8 +415,9 @@ class NodeService:
         except Urllib3HTTPError as exc:
             raise _connection_error(cluster, exc) from exc
 
-        # Step 3 — filter ineligible pods.
+        # Step 3 — classify. Skips are unconditional; blocks are opt-out.
         pods_to_evict = []
+        blocked: list[dict] = []
         for pod in pod_list.items:
             annotations = pod.metadata.annotations or {}
             owner_kinds = [ref.kind for ref in (pod.metadata.owner_references or [])]
@@ -399,7 +439,35 @@ class NodeService:
                 _logger.debug("Skipping DaemonSet pod | pod=%s", pod.metadata.name)
                 continue
 
+            # Protected categories. Each is removable only with its opt-out
+            # flag; without it the whole drain is refused before anything is
+            # evicted. Both reasons are collected, never short-circuited, so
+            # one round-trip reports every flag the caller needs.
+            reasons: list[str] = []
+            if not owner_kinds and not options.force:
+                reasons.append("unmanaged")
+            if self._uses_emptydir(pod) and not options.delete_emptydir_data:
+                reasons.append("emptydir")
+
+            if reasons:
+                blocked.append({
+                    "namespace": pod.metadata.namespace,
+                    "name": pod.metadata.name,
+                    "reasons": reasons,
+                })
+                continue
+
             pods_to_evict.append(pod)
+
+        # Refuse before evicting anything. A half-drained node is worse than an
+        # untouched one: the pods already killed cannot be brought back, and the
+        # node is still not empty.
+        if blocked:
+            _logger.warning(
+                "Drain blocked | cluster=%s | node=%s | blocked=%d",
+                cluster, node_name, len(blocked),
+            )
+            raise DrainBlockedException(node_name=node_name, blocked=blocked)
 
         _logger.info(
             "Pods to evict | cluster=%s | node=%s | count=%d",
@@ -415,30 +483,50 @@ class NodeService:
                 options=options,
             )
 
-        # Step 5 — wait for pods to terminate. The wait budget is server-owned
-        # (DRAIN_DEFAULT_TIMEOUT_SECONDS), kept below the proxy read timeout so the
-        # app returns a structured 504 instead of a bare proxy 500; the client
-        # cannot set it. On timeout we suggest stronger flags based on `options`.
+        # Step 5 — watch for termination. Exceeding the budget is NOT a failure:
+        # every eviction was accepted, and a pod with a long grace period is
+        # shutting down exactly as configured. The leftovers are reported in the
+        # 200 response so the caller can see what is still going without
+        # diffing two pod listings.
         timeout_seconds = get_settings().DRAIN_DEFAULT_TIMEOUT_SECONDS
-        self._wait_for_pods_gone(
+        still_present = self._wait_for_pods_gone(
             kube=kube,
             node_name=node_name,
             pod_names={(p.metadata.namespace, p.metadata.name) for p in pods_to_evict},
             timeout_seconds=timeout_seconds,
-            options=options,
         )
 
         drained_pods = [
             DrainedPodInfo(name=p.metadata.name, namespace=p.metadata.namespace)
             for p in pods_to_evict
         ]
-        _logger.info("Drain complete | cluster=%s | node=%s | drained=%d", cluster, node_name, len(drained_pods))
+        still_terminating = [
+            StillTerminatingPodInfo(name=name, namespace=ns)
+            for ns, name in sorted(still_present)
+        ]
+        _logger.info(
+            "Drain complete | cluster=%s | node=%s | drained=%d | still_terminating=%d",
+            cluster, node_name, len(drained_pods), len(still_terminating),
+        )
         return DrainActionData(
             cluster=cluster,
             node=node_name,
             action="drain",
             drained_pods=drained_pods,
+            still_terminating=still_terminating,
+            node_emptied=not still_terminating,
+            forced_deletion=options.grace_period_seconds == 0,
         )
+
+    @staticmethod
+    def _uses_emptydir(pod) -> bool:
+        """True when the pod mounts at least one emptyDir volume.
+
+        emptyDir lives and dies with the pod, so evicting one destroys data
+        that exists nowhere else — hence the opt-out flag.
+        """
+        volumes = (pod.spec.volumes or []) if pod.spec else []
+        return any(v.empty_dir is not None for v in volumes)
 
     # ── Label management ──────────────────────────────────────────────────────
 
@@ -654,6 +742,26 @@ class NodeService:
         node = self._read_node(cluster, node_name, kube)
         return node.metadata.annotations or {}
 
+    def _node_statuses(self, cluster: str, kube: CoreV1Api) -> dict[str, str]:
+        """Map every node name in the cluster to its readiness, in one call.
+
+        Used by the batch uncordon gate so N nodes cost one listing rather than
+        N reads. A failure here is cluster-level by construction — the listing
+        is not about any single node — so it propagates rather than being
+        recorded against whichever node happened to be first.
+        """
+        try:
+            node_list = kube.list_node()
+        except ApiException as exc:
+            raise KubeApiException(
+                f"Failed to list nodes in cluster '{cluster}': {exc.reason}",
+                kube_status=exc.status,
+            ) from exc
+        except Urllib3HTTPError as exc:
+            raise _connection_error(cluster, exc) from exc
+
+        return {n.metadata.name: self._node_status(n) for n in node_list.items}
+
     def _read_node(self, cluster: str, node_name: str, kube: CoreV1Api):
         """Read a node, mapping 404 → NodeNotFoundException."""
         try:
@@ -735,13 +843,20 @@ class NodeService:
         node_name: str,
         pod_names: set[tuple[str, str]],
         timeout_seconds: int,
-        options: DrainOptions | None = None,
-    ) -> None:
+    ) -> set[tuple[str, str]]:
+        """Poll until the targeted pods are gone or the budget expires.
+
+        Returns the ``(namespace, name)`` pairs still present when the budget
+        ran out — empty when the node drained cleanly. Exhausting the budget is
+        a normal outcome, not an error: the evictions were all accepted and a
+        pod with a long ``terminationGracePeriodSeconds`` is behaving as
+        configured. The caller decides what a non-empty result means.
+        """
         if not pod_names:
-            return
+            return set()
         deadline = time.monotonic() + timeout_seconds
         still_present: set[tuple[str, str]] = set(pod_names)
-        while time.monotonic() < deadline:
+        while True:
             try:
                 remaining = kube.list_pod_for_all_namespaces(
                     field_selector=f"spec.nodeName={node_name}"
@@ -763,31 +878,55 @@ class NodeService:
             }
             if not still_present:
                 _logger.debug("All targeted pods are gone | node=%s", node_name)
-                return
+                return set()
+            if time.monotonic() >= deadline:
+                _logger.info(
+                    "Drain wait budget spent | node=%s | still_terminating=%d",
+                    node_name, len(still_present),
+                )
+                return still_present
             _logger.debug(
                 "Waiting for %d pod(s) to terminate | node=%s",
                 len(still_present), node_name,
             )
             time.sleep(2)
 
-        # Timed out — surface a structured 504 (not a proxy 500) that names the
-        # stuck pods, tells the caller drain can be safely retried, and suggests
-        # stronger flags based on the options that were used.
-        raise DrainTimeoutException(
-            node_name=node_name,
-            timeout_seconds=timeout_seconds,
-            still_running=list(still_present),
-            current_options=options,
-        )
+    @staticmethod
+    def _node_status(node: V1Node) -> str:
+        """Derive a node's readiness: "Ready", "NotReady" or "Unknown".
+
+        The three map onto the Ready condition's ``status`` field, which is a
+        *three-valued* string, not a boolean:
+
+        - ``"True"``    → Ready.
+        - ``"False"``   → NotReady: the kubelet is reporting and says it is
+          unhealthy.
+        - ``"Unknown"`` → the node controller has stopped hearing from the
+          kubelet altogether (~40s of silence). The condition stays present and
+          its status becomes the literal string "Unknown" — the controller does
+          not remove it — so this must be read off ``cond.status`` rather than
+          inferred from a missing condition.
+
+        "Unknown" is a *worse* signal than NotReady, not a milder one: nothing
+        is reporting at all. Callers gating on health must therefore treat only
+        "Ready" as passing rather than listing the bad values, since any future
+        status string would otherwise be admitted by default.
+
+        A node with no conditions at all has only just registered and has not
+        yet been assessed; it is reported "Unknown" for the same reason — its
+        health is unestablished.
+        """
+        for cond in (node.status.conditions or []):
+            if cond.type == "Ready":
+                if cond.status == "True":
+                    return "Ready"
+                return "Unknown" if cond.status == "Unknown" else "NotReady"
+        return "Unknown"
 
     @staticmethod
     def _node_to_info(node: V1Node) -> NodeInfo:
         """Convert a V1Node object to a NodeInfo response model."""
-        status = "Unknown"
-        for cond in (node.status.conditions or []):
-            if cond.type == "Ready":
-                status = "Ready" if cond.status == "True" else "NotReady"
-                break
+        status = NodeService._node_status(node)
 
         labels = node.metadata.labels or {}
         roles = [

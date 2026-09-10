@@ -1,0 +1,193 @@
+# tests/e2e/manifests/drain-scenarios.yaml
+#
+# Pod scenarios for the drain e2e suite. Every workload is pinned to a single
+# node via nodeName so a drain of that node has a predictable target set.
+# The node name is templated as NODE_NAME and substituted at apply time.
+#
+# Each scenario exists to make exactly one drain option observable:
+#
+#   clean-web           eligible with no flags          (control)
+#   bare-pod            no ownerReferences              → needs force
+#   emptydir-cache      mounts an emptyDir volume       → needs delete_emptydir_data
+#   bare-emptydir       both of the above at once       → needs both flags
+#   pdb-guarded         1 replica under a strict PDB    → needs disable_eviction
+#   slow-terminator     ignores SIGTERM, grace 120s     → exercises still_terminating
+#   drain-daemon        DaemonSet                       → always skipped
+#   completed-job       Succeeded pod                   → always skipped
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-drain
+---
+# ── Control: an ordinary managed pod, evictable with no flags at all ──────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clean-web
+  namespace: test-drain
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: clean-web}
+  template:
+    metadata:
+      labels: {app: clean-web, scenario: clean}
+    spec:
+      nodeName: NODE_NAME
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+---
+# ── force: a bare pod has no controller to recreate it, so deleting it is
+#    permanent. kubectl refuses without --force; so do we.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bare-pod
+  namespace: test-drain
+  labels: {scenario: unmanaged}
+spec:
+  nodeName: NODE_NAME
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+---
+# ── delete_emptydir_data: emptyDir is created with the pod and destroyed with
+#    it, so its contents exist nowhere else in the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emptydir-cache
+  namespace: test-drain
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: emptydir-cache}
+  template:
+    metadata:
+      labels: {app: emptydir-cache, scenario: emptydir}
+    spec:
+      nodeName: NODE_NAME
+      terminationGracePeriodSeconds: 1
+      volumes:
+        - name: scratch
+          emptyDir: {}
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          volumeMounts:
+            - {name: scratch, mountPath: /scratch}
+---
+# ── Both guards on one pod: the response must name both flags at once, not
+#    make the caller discover them one retry at a time.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bare-emptydir
+  namespace: test-drain
+  labels: {scenario: unmanaged-emptydir}
+spec:
+  nodeName: NODE_NAME
+  terminationGracePeriodSeconds: 1
+  volumes:
+    - name: scratch
+      emptyDir: {}
+  containers:
+    - name: pause
+      image: registry.k8s.io/pause:3.9
+      volumeMounts:
+        - {name: scratch, mountPath: /scratch}
+---
+# ── disable_eviction: minAvailable equal to the replica count means the
+#    Eviction API can never allow a voluntary disruption — it returns 429
+#    forever. Only a raw DELETE gets past it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdb-guarded
+  namespace: test-drain
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: pdb-guarded}
+  template:
+    metadata:
+      labels: {app: pdb-guarded, scenario: pdb}
+    spec:
+      nodeName: NODE_NAME
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-guarded
+  namespace: test-drain
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: pdb-guarded}
+---
+# ── grace_period_seconds / still_terminating: traps SIGTERM and keeps running,
+#    so it only leaves when the grace period expires or grace=0 kills it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slow-terminator
+  namespace: test-drain
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: slow-terminator}
+  template:
+    metadata:
+      labels: {app: slow-terminator, scenario: slow}
+    spec:
+      nodeName: NODE_NAME
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: sleeper
+          image: busybox:1.36
+          command: ["sh", "-c", "trap '' TERM; while true; do sleep 1; done"]
+---
+# ── Always skipped: a DaemonSet pod is expected on every node, so draining it
+#    is pointless — the controller puts it straight back.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: drain-daemon
+  namespace: test-drain
+spec:
+  selector:
+    matchLabels: {app: drain-daemon}
+  template:
+    metadata:
+      labels: {app: drain-daemon, scenario: daemonset}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+---
+# ── Always skipped: a finished pod holds no workload. Note it is also bare
+#    (a Job's pod is owned by the Job, but this one is standalone) — proving
+#    the completed check runs before the force check.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: completed-job
+  namespace: test-drain
+  labels: {scenario: completed}
+spec:
+  nodeName: NODE_NAME
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: done
+      image: busybox:1.36
+      command: ["true"]
